@@ -126,12 +126,28 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const getVideoExt = (item: CapturedMediaItem) =>
     item.mimeType.toLowerCase().includes('mp4') ? 'mp4' : 'webm';
 
-  const handleDownload = (item: CapturedMediaItem) => {
-    const a = document.createElement('a');
-    a.href = item.url;
+  const handleDownload = async (item: CapturedMediaItem) => {
     const ext = item.type === 'video' ? getVideoExt(item) : 'png';
     const stamp = new Date(item.createdAt).toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    a.download = `optica-${item.type}-${stamp}.${ext}`;
+    const defaultName = `optica-${item.type}-${stamp}.${ext}`;
+
+    if (window.opticaDesktop?.saveMediaFile) {
+      try {
+        const bytes = new Uint8Array(await item.blob.arrayBuffer());
+        await window.opticaDesktop.saveMediaFile({
+          defaultName,
+          extension: ext,
+          bytes,
+        });
+        return;
+      } catch {
+        // Fallback to standard blob download if native dialog fails
+      }
+    }
+
+    const a = document.createElement('a');
+    a.href = item.url;
+    a.download = defaultName;
     a.click();
   };
 

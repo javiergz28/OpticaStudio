@@ -31,14 +31,26 @@ export const TopBar: React.FC<TopBarProps> = ({
     { id: 'gallery', label: galleryCount > 0 ? `Galería (${galleryCount})` : 'Galería' },
   ];
 
+  const isMacDesktop =
+    typeof window !== 'undefined' &&
+    Boolean(window.opticaDesktop?.isElectron && window.opticaDesktop.platform === 'darwin');
+
   return (
-    <header className="px-4 pt-3 pb-1 shrink-0 z-30">
-      <div className="liquid-glass-dock rounded-full px-4 py-1.5 flex items-center justify-between gap-6">
+    <header
+      className={`px-4 pt-3 pb-1 shrink-0 z-30 ${
+        isMacDesktop ? '[-webkit-app-region:drag]' : ''
+      }`}
+    >
+      <div
+        className={`liquid-glass-dock rounded-full py-1.5 flex items-center justify-between gap-6 ${
+          isMacDesktop ? 'pl-[76px] pr-4' : 'px-4'
+        }`}
+      >
         {/* Zone 1: Single text element wordmark */}
         <button
           type="button"
           onClick={() => onSelectTab('studio')}
-          className="pl-1.5 text-[15px] font-semibold tracking-tight text-white/95 whitespace-nowrap shrink-0 hover:text-white transition-colors cursor-pointer"
+          className="pl-1.5 text-[15px] font-semibold tracking-tight text-white/95 whitespace-nowrap shrink-0 hover:text-white transition-colors cursor-pointer [-webkit-app-region:no-drag]"
         >
           Óptica Studio
         </button>
@@ -46,7 +58,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         {/* Zone 2: Apple Liquid Glass floating segmented navigation */}
         <nav
           aria-label="Espacios de trabajo"
-          className="liquid-segmented min-w-0 flex items-center gap-0.5 overflow-x-auto no-scrollbar"
+          className="liquid-segmented min-w-0 flex items-center gap-0.5 overflow-x-auto no-scrollbar [-webkit-app-region:no-drag]"
         >
           {navItems.map((item) => {
             const isActive =
@@ -69,7 +81,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         </nav>
 
         {/* Zone 3: Cinema Focus Toggle + Primary Action */}
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2 shrink-0 [-webkit-app-region:no-drag]">
           {activeTab !== 'gallery' && (
             <button
               type="button"

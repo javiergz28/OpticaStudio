@@ -1744,6 +1744,42 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [triggerPhotoCapture, toggleRecording]);
 
+  // Native macOS Desktop Menu Actions & safe hardware release on window close
+  useEffect(() => {
+    const unsubMenu = window.opticaDesktop?.onMenuAction((action) => {
+      switch (action) {
+        case 'capture-photo':
+          void triggerPhotoCapture();
+          break;
+        case 'capture-window':
+          void captureOtherWindowScreenshot(false);
+          break;
+        case 'toggle-record':
+          toggleRecording();
+          break;
+        case 'open-gallery':
+          setActiveTab('gallery');
+          break;
+        case 'toggle-cinema-mode':
+          setInspectorCollapsed((v) => !v);
+          break;
+      }
+    });
+
+    const releaseStreamsOnUnload = () => {
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+      secondaryStreamRef.current?.getTracks().forEach((t) => t.stop());
+      audioAnalyserRef.current?.ctx.close().catch(() => {});
+    };
+
+    window.addEventListener('beforeunload', releaseStreamsOnUnload);
+    return () => {
+      unsubMenu?.();
+      window.removeEventListener('beforeunload', releaseStreamsOnUnload);
+    };
+  }, [triggerPhotoCapture, captureOtherWindowScreenshot, toggleRecording]);
+
   const handleSaveEditedItem = useCallback(
     async (item: CapturedMediaItem, replaceId?: string) => {
       if (replaceId) {

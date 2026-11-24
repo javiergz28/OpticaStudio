@@ -1,0 +1,48 @@
+appId: com.opticastudio.desktop
+productName: Optica Studio
+copyright: Copyright © 2026 Óptica Studio
+asar: true
+
+directories:
+  output: release
+  buildResources: build-resources
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - build-resources/icon.png
+  - package.json
+  - "!node_modules/**/*"
+
+mac:
+  category: public.app-category.photography
+  icon: build-resources/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build-resources/entitlements.mac.plist
+  entitlementsInherit: build-resources/entitlements.mac.plist
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  extendInfo:
+    CFBundleDisplayName: "Óptica Studio"
+    NSCameraUsageDescription: "Óptica Studio necesita acceso a tu cámara para mostrar la vista en vivo, aplicar filtros cinematográficos, segmentación por IA y grabar fotografía o video."
+    NSMicrophoneUsageDescription: "Óptica Studio necesita acceso al micrófono para capturar audio sincronizado y nivelación vocal durante las grabaciones de video."
+    NSScreenCaptureUsageDescription: "Óptica Studio necesita permiso de grabación de pantalla para capturar otras ventanas o combinar tu pantalla con cámara PiP."
+
+dmg:
+  title: "Optica Studio ${version}"
+  icon: build-resources/icon.icns
+  artifactName: "Optica-Studio-macOS-${arch}.${ext}"
+  window:
+    width: 560
+    height: 380
+  iconSize: 108
+  contents:
+    - x: 150
+      y: 195
+    - x: 410
+      y: 195
+      type: link
+      path: /Applications

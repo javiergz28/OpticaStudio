@@ -1,6 +1,12 @@
 node_modules/
 build/
 dist/
+dist-electron/
+release/
+build-resources/.tmp-icons/
+build-resources/*.iconset/
+*.dmg
+*.blockmap
 coverage/
 .DS_Store
 *.log
