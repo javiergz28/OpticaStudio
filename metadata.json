@@ -1,0 +1,11 @@
+{
+  "name": "Óptica Studio",
+  "description": "Estudio avanzado para cámara de MacBook con filtros en tiempo real, cabina de fotos, grabación con pantalla, teleprompter, escáner de documentos y herramientas ópticas.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
