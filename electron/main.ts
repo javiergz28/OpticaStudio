@@ -439,6 +439,9 @@ function configureDisplayCaptureHandler(): void {
         return;
       }
 
+      if (process.platform === 'darwin') {
+        console.info('[Optica] Display capture permission:', systemPreferences.getMediaAccessStatus('screen'));
+      }
       const sources = await desktopCapturer.getSources({
         types: ['screen', 'window'],
         thumbnailSize: { width: 420, height: 236 },
@@ -447,6 +450,7 @@ function configureDisplayCaptureHandler(): void {
 
       const filtered = sources.filter((src) => src.name !== 'Seleccionar ventana o pantalla');
       if (filtered.length === 0) {
+        console.warn('[Optica] No display sources available');
         callback({});
         return;
       }
@@ -467,7 +471,8 @@ function configureDisplayCaptureHandler(): void {
         video: chosen,
         audio: request.audioRequested ? 'loopback' : undefined,
       });
-    } catch {
+    } catch (error) {
+      console.warn('[Optica] Display capture failed:', error instanceof Error ? error.name : 'unknown');
       callback({});
     }
   });

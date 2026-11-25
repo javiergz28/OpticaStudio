@@ -1469,73 +1469,10 @@ export function renderFocusPeakingOverlay(
   ctx.putImageData(out, 0, 0);
 }
 
-export function renderSyntheticCameraFeed(ctx: CanvasRenderingContext2D, w: number, h: number, timeSec: number) {
-  // Studio backdrop gradient
-  const bg = ctx.createLinearGradient(0, 0, w, h);
-  bg.addColorStop(0, '#18181b');
-  bg.addColorStop(0.5, '#27272a');
-  bg.addColorStop(1, '#121216');
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, w, h);
-
-  // Soft warm key light & cool rim light blobs for testing color LUTs & filters realistically
-  const keyX = w * 0.35 + Math.sin(timeSec * 0.7) * (w * 0.08);
-  const keyY = h * 0.38 + Math.cos(timeSec * 0.5) * (h * 0.05);
-  const warmGlow = ctx.createRadialGradient(keyX, keyY, 10, keyX, keyY, w * 0.45);
-  warmGlow.addColorStop(0, 'rgba(251, 191, 36, 0.42)');
-  warmGlow.addColorStop(0.5, 'rgba(244, 63, 94, 0.14)');
-  warmGlow.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = warmGlow;
-  ctx.fillRect(0, 0, w, h);
-
-  const rimX = w * 0.72 + Math.cos(timeSec * 0.6) * (w * 0.06);
-  const rimY = h * 0.6;
-  const coolGlow = ctx.createRadialGradient(rimX, rimY, 10, rimX, rimY, w * 0.42);
-  coolGlow.addColorStop(0, 'rgba(56, 189, 248, 0.34)');
-  coolGlow.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = coolGlow;
-  ctx.fillRect(0, 0, w, h);
-
-  // Color checker & studio portrait silhouette calibration target
-  const cx = w * 0.5;
-  const cy = h * 0.52;
-  const radius = Math.min(w, h) * 0.16;
-
-  // Stylized portrait silhouette
+/** Neutral background for unavailable camera input; never simulate a person or test pattern. */
+export function renderUnavailableCameraFrame(ctx: CanvasRenderingContext2D, w: number, h: number) {
   ctx.save();
-  ctx.fillStyle = '#e4c3a8';
-  ctx.beginPath();
-  ctx.arc(cx, cy - radius * 0.35, radius * 0.68, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = '#3f3f46';
-  ctx.beginPath();
-  ctx.ellipse(cx, cy + radius * 1.15, radius * 1.25, radius * 0.9, 0, Math.PI, Math.PI * 2);
-  ctx.fill();
-
-  // Subtle facial features for testing filters/mirror/sketch
-  ctx.fillStyle = '#27272a';
-  ctx.beginPath();
-  ctx.arc(cx - radius * 0.22, cy - radius * 0.42, radius * 0.07, 0, Math.PI * 2);
-  ctx.arc(cx + radius * 0.22, cy - radius * 0.42, radius * 0.07, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = '#9f6b56';
-  ctx.lineWidth = Math.max(2, radius * 0.05);
-  ctx.beginPath();
-  ctx.arc(cx, cy - radius * 0.2, radius * 0.2, 0.15 * Math.PI, 0.85 * Math.PI);
-  ctx.stroke();
-
-  // Color calibration swatches bar on lower left for testing LUTs
-  const swatches = ['#ef4444', '#f59e0b', '#10b981', '#06b6d4', '#3b82f6', '#ffffff', '#71717a', '#09090b'];
-  const swSize = Math.max(16, Math.round(w * 0.028));
-  swatches.forEach((col, i) => {
-    ctx.fillStyle = col;
-    ctx.fillRect(w * 0.05 + i * (swSize + 4), h * 0.1, swSize, swSize);
-  });
-
-  // Notice label in synthetic mode
-  ctx.fillStyle = 'rgba(244, 244, 245, 0.72)';
-  ctx.font = `500 ${Math.max(12, Math.round(h * 0.022))}px "JetBrains Mono", monospace`;
-  ctx.fillText('MODO DEMO ÓPTICO · ACTIVA TU CÁMARA MACBOOK', w * 0.05, h * 0.07);
+  ctx.fillStyle = '#09090b';
+  ctx.fillRect(0, 0, w, h);
   ctx.restore();
 }

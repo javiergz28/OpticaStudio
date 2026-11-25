@@ -14,7 +14,6 @@ import {
   Trash2,
   Upload,
   UserCheck,
-  X,
 } from 'lucide-react';
 import {
   DEFAULT_ADJUSTMENTS,
@@ -25,6 +24,13 @@ import {
   type RotationDeg,
 } from '../types/camera';
 import { applyFullColorGrade } from '../utils/canvasProcessor';
+import {
+  GlassButton,
+  GlassDialog,
+  GlassIconButton,
+  GlassSegmentedControl,
+  GlassSlider,
+} from './glass';
 
 interface GalleryViewProps {
   items: CapturedMediaItem[];
@@ -72,24 +78,22 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 }) => {
   const [filterType, setFilterType] = useState<'all' | 'photo' | 'screen' | 'booth' | 'video'>('all');
   const [selectedItem, setSelectedItem] = useState<CapturedMediaItem | null>(null);
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Lightbox Quick Editor state
   const [editorMode, setEditorMode] = useState<'view' | 'edit'>('view');
 
-  // Image editor states
   const [editFilterId, setEditFilterId] = useState<FilterPresetId>('none');
   const [editBrightness, setEditBrightness] = useState(0);
   const [editContrast, setEditContrast] = useState(0);
   const [editSaturation, setEditSaturation] = useState(0);
   const [editRotation, setEditRotation] = useState<RotationDeg>(0);
   const [cropPreset, setCropPreset] = useState<CropAspectPreset>('free');
-  const [cropScale, setCropScale] = useState(100); // 30 to 100%
-  const [cropCenterX, setCropCenterX] = useState(50); // 0 to 100%
-  const [cropCenterY, setCropCenterY] = useState(50); // 0 to 100%
+  const [cropScale, setCropScale] = useState(100);
+  const [cropCenterX, setCropCenterX] = useState(50);
+  const [cropCenterY, setCropCenterY] = useState(50);
   const [savingImageEdit, setSavingImageEdit] = useState(false);
 
-  // Video editor states
   const lightboxVideoRef = useRef<HTMLVideoElement | null>(null);
   const editCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const loadedEditImgRef = useRef<HTMLImageElement | null>(null);
@@ -141,7 +145,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         });
         return;
       } catch {
-        // Fallback to standard blob download if native dialog fails
+        // Fallback a descarga estándar
       }
     }
 
@@ -158,7 +162,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       setCopiedId(item.id);
       setTimeout(() => setCopiedId(null), 1500);
     } catch {
-      // Fallback ignored if browser blocks clipboard image write
+      // Ignorar si el navegador bloquea escritura al portapapeles
     }
   };
 
@@ -167,7 +171,6 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
   const getEffectName = (id: string) =>
     VISUAL_EFFECTS.find((e) => e.id === id)?.name || 'Sin efecto';
 
-  // Compute exact crop rectangle inside rotated source dimensions
   const computeCropRect = (srcW: number, srcH: number) => {
     const scale = cropScale / 100;
     let cw = srcW * scale;
@@ -196,7 +199,6 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
     return { sx, sy, sw: cw, sh: ch };
   };
 
-  // Load image and render live interactive crop + filter preview in Image Editor
   useEffect(() => {
     if (!selectedItem || selectedItem.type === 'video' || editorMode !== 'edit') return;
 
@@ -212,7 +214,6 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       const rotW = swap ? img.naturalHeight : img.naturalWidth;
       const rotH = swap ? img.naturalWidth : img.naturalHeight;
 
-      // Preview fitted to max 960px while preserving aspect ratio
       const previewScale = Math.min(1, 960 / Math.max(rotW, rotH));
       const pw = Math.max(1, Math.round(rotW * previewScale));
       const ph = Math.max(1, Math.round(rotH * previewScale));
@@ -245,7 +246,6 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         );
       }
 
-      // Overlay crop region guide
       const { sx, sy, sw, sh } = computeCropRect(pw, ph);
       if (sw < pw - 2 || sh < ph - 2) {
         ctx.save();
@@ -439,12 +439,13 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       }
 
       const streamTracks: MediaStreamTrack[] = [...canvas.captureStream(30).getVideoTracks()];
-      const capFn = (
-        hiddenVideo as unknown as {
-          captureStream?: () => MediaStream;
-          mozCaptureStream?: () => MediaStream;
-        }
-      ).captureStream ||
+      const capFn =
+        (
+          hiddenVideo as unknown as {
+            captureStream?: () => MediaStream;
+            mozCaptureStream?: () => MediaStream;
+          }
+        ).captureStream ||
         (
           hiddenVideo as unknown as {
             mozCaptureStream?: () => MediaStream;
@@ -517,38 +518,39 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
       setSelectedItem(trimmedItem);
       setEditorMode('view');
     } catch {
-      // Ignore error cleanly
+      // Ignorar errores limpiamente
     } finally {
       setTrimmingProgress(null);
     }
   };
 
   return (
-    <section className="flex-1 overflow-y-auto studio-scroll p-5 lg:p-8">
-      <div className="max-w-6xl mx-auto space-y-6">
-        {/* Header & Liquid Glass Filter Bar */}
-        <div className="liquid-glass-panel rounded-[24px] p-5 flex flex-wrap items-center justify-between gap-4">
+    <section className="flex-1 overflow-y-auto studio-scroll px-5 py-5 lg:px-8 lg:py-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        {/* Cabecera abierta sobre la superficie continua */}
+        <header className="pb-4 border-b border-[var(--border-hairline)] flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="text-xl font-bold tracking-tight text-white">
+            <h1 className="text-lg font-semibold tracking-tight text-[var(--text-primary)]">
               Galería de Capturas
             </h1>
-            <p className="text-xs text-zinc-300/80 mt-1">
-              {items.length} elementos guardados localmente · Pega capturas de Mac con ⌘V
+            <p className="text-xs text-[var(--text-tertiary)] mt-0.5">
+              <span className="font-mono tabular-nums">{items.length}</span> elementos locales
+              <span aria-hidden="true"> · </span>
+              Pega capturas de Mac con ⌘V
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
-            <button
-              type="button"
+          <div className="flex flex-wrap items-center gap-2">
+            <GlassButton
+              variant="primary"
               onClick={onCaptureWindow}
-              className="liquid-glass-blue inline-flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-semibold whitespace-nowrap cursor-pointer"
+              leadingIcon={<Monitor className="w-3.5 h-3.5" />}
             >
-              <Monitor className="w-3.5 h-3.5" />
-              <span>Capturar ventana</span>
-            </button>
+              Capturar ventana
+            </GlassButton>
 
-            <label className="liquid-glass-btn inline-flex items-center gap-1.5 px-4 py-2 rounded-full text-zinc-100 text-xs font-medium whitespace-nowrap cursor-pointer">
-              <Upload className="w-3.5 h-3.5 text-amber-300" />
+            <label className="liquid-glass-btn glass-focus-ring inline-flex items-center gap-1.5 h-8 px-3.5 rounded-full text-xs font-medium whitespace-nowrap cursor-pointer">
+              <Upload className="w-3.5 h-3.5 text-[var(--accent-amber)]" />
               <span>Importar imagen</span>
               <input
                 type="file"
@@ -564,75 +566,60 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
               />
             </label>
 
-            <div className="liquid-segmented flex items-center gap-0.5">
-              {(
-                [
-                  { id: 'all', label: 'Todo' },
-                  { id: 'photo', label: 'Fotos' },
-                  { id: 'screen', label: 'Ventanas' },
-                  { id: 'booth', label: 'Cabina' },
-                  { id: 'video', label: 'Videos' },
-                ] as const
-              ).map((tab) => (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => setFilterType(tab.id)}
-                  className={`px-3.5 py-1.5 text-xs font-medium rounded-full transition-all whitespace-nowrap cursor-pointer ${
-                    filterType === tab.id
-                      ? 'liquid-segment-thumb text-white'
-                      : 'text-zinc-300/75 hover:text-white'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
+            <GlassSegmentedControl<'all' | 'photo' | 'screen' | 'booth' | 'video'>
+              layoutGroupId="gallery-filter-tabs"
+              ariaLabel="Filtrar capturas por tipo"
+              value={filterType}
+              onChange={setFilterType}
+              options={[
+                { id: 'all', label: 'Todo' },
+                { id: 'photo', label: 'Fotos' },
+                { id: 'screen', label: 'Ventanas' },
+                { id: 'booth', label: 'Cabina' },
+                { id: 'video', label: 'Videos' },
+              ]}
+            />
 
             {items.length > 0 && (
-              <button
-                type="button"
-                onClick={onClearAll}
-                className="liquid-glass-btn px-3.5 py-2 rounded-full text-xs font-medium text-zinc-300 hover:text-rose-300 whitespace-nowrap cursor-pointer"
+              <GlassButton
+                variant="ghost"
+                onClick={() => setConfirmClearOpen(true)}
+                className="hover:text-rose-500 dark:hover:text-rose-300"
               >
                 Vaciar todo
-              </button>
+              </GlassButton>
             )}
           </div>
-        </div>
+        </header>
 
-        {/* Empty State */}
+        {/* Estado vacío */}
         {filteredItems.length === 0 ? (
-          <div className="liquid-glass-panel rounded-[26px] py-20 px-6 text-center space-y-4">
-            <div className="liquid-glass-btn w-12 h-12 rounded-2xl flex items-center justify-center mx-auto text-zinc-200">
-              <ImageIcon className="w-5 h-5" />
+          <div className="py-20 px-6 text-center space-y-4">
+            <div className="w-11 h-11 rounded-xl border border-[var(--border-hairline)] bg-[var(--studio-surface-subtle)] flex items-center justify-center mx-auto">
+              <ImageIcon className="w-5 h-5 text-[var(--text-secondary)]" />
             </div>
             <div className="space-y-1">
-              <h2 className="text-sm font-semibold text-white">
+              <h2 className="text-sm font-semibold text-[var(--text-primary)]">
                 Aún no hay capturas en esta vista
               </h2>
-              <p className="text-xs text-zinc-300/75 max-w-md mx-auto">
-                Vuelve al estudio para tomar fotografías, capturar otras ventanas o grabar clips en MP4/WebM con filtros aplicados en tiempo real.
+              <p className="text-xs text-[var(--text-tertiary)] max-w-md mx-auto leading-relaxed">
+                Vuelve al estudio para tomar fotografías, capturar ventanas de macOS o grabar clips en MP4/WebM con filtros en tiempo real.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={onBackToStudio}
-              className="liquid-glass-blue px-5 py-2 rounded-full text-xs font-semibold cursor-pointer"
-            >
+            <GlassButton variant="primary" size="md" onClick={onBackToStudio}>
               Volver al Estudio
-            </button>
+            </GlassButton>
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
             {filteredItems.map((item) => (
               <article
                 key={item.id}
-                className="group liquid-glass-panel rounded-[22px] overflow-hidden flex flex-col"
+                className="group bg-[var(--studio-surface-content)] border border-[var(--border-hairline)] rounded-2xl overflow-hidden flex flex-col transition-colors hover:border-[var(--border-specular)]"
               >
                 <div
                   onClick={() => openLightbox(item)}
-                  className="aspect-video bg-black/90 relative overflow-hidden cursor-pointer"
+                  className="aspect-video bg-black relative overflow-hidden cursor-pointer"
                 >
                   {item.type === 'video' ? (
                     <>
@@ -642,10 +629,11 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                         muted
                         playsInline
                       />
-                      <div className="liquid-glass-dock absolute bottom-2.5 left-2.5 px-2.5 py-0.5 rounded-full font-mono text-[11px] text-white flex items-center gap-1.5">
+                      <div className="glass-clear absolute bottom-2.5 left-2.5 px-2.5 py-0.5 rounded-full font-mono tabular-nums text-[11px] text-white flex items-center gap-1.5">
                         <Film className="w-3 h-3 text-rose-400" />
                         <span>
-                          {item.durationSec ? `${item.durationSec}s` : 'VIDEO'} · {getVideoExt(item).toUpperCase()}
+                          {item.durationSec ? `${item.durationSec}s` : 'VIDEO'} ·{' '}
+                          {getVideoExt(item).toUpperCase()}
                         </span>
                       </div>
                     </>
@@ -661,10 +649,10 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
 
                 <div className="p-3.5 flex items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <div className="text-xs font-semibold text-white truncate">
+                    <div className="text-xs font-semibold text-[var(--text-primary)] truncate">
                       {item.label}
                     </div>
-                    <div className="text-[11px] font-mono text-zinc-300/75 mt-0.5 truncate">
+                    <div className="text-[11px] font-mono tabular-nums text-[var(--text-tertiary)] mt-0.5 truncate">
                       {item.width}×{item.height} · {getFilterName(item.filterId)}
                     </div>
                   </div>
@@ -672,44 +660,41 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
                   <div className="flex items-center gap-1 shrink-0">
                     {item.type !== 'video' && (
                       <>
-                        <button
-                          type="button"
+                        <GlassIconButton
+                          size="sm"
+                          label="Usar esta captura como fondo virtual IA"
                           onClick={() => onUseAsBackground(item)}
-                          title="Usar esta captura como fondo virtual IA"
-                          className="liquid-glass-btn w-7 h-7 rounded-full flex items-center justify-center text-zinc-200 hover:text-emerald-300 cursor-pointer"
                         >
-                          <UserCheck className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
+                          <UserCheck className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-300" />
+                        </GlassIconButton>
+                        <GlassIconButton
+                          size="sm"
+                          label="Copiar imagen al portapapeles"
                           onClick={() => handleCopyImage(item)}
-                          title="Copiar imagen al portapapeles"
-                          className="liquid-glass-btn w-7 h-7 rounded-full flex items-center justify-center text-zinc-200 hover:text-white cursor-pointer"
                         >
                           {copiedId === item.id ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-300" />
+                            <Check className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-300" />
                           ) : (
                             <Copy className="w-3.5 h-3.5" />
                           )}
-                        </button>
+                        </GlassIconButton>
                       </>
                     )}
-                    <button
-                      type="button"
+                    <GlassIconButton
+                      size="sm"
+                      label="Descargar archivo"
                       onClick={() => handleDownload(item)}
-                      title="Descargar archivo"
-                      className="liquid-glass-btn w-7 h-7 rounded-full flex items-center justify-center text-zinc-200 hover:text-amber-300 cursor-pointer"
                     >
                       <Download className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      type="button"
+                    </GlassIconButton>
+                    <GlassIconButton
+                      size="sm"
+                      label="Eliminar captura"
                       onClick={() => onDeleteItem(item.id)}
-                      title="Eliminar"
-                      className="liquid-glass-btn w-7 h-7 rounded-full flex items-center justify-center text-zinc-200 hover:text-rose-300 cursor-pointer"
+                      className="hover:text-rose-500 dark:hover:text-rose-300"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                    </GlassIconButton>
                   </div>
                 </div>
               </article>
@@ -718,398 +703,359 @@ export const GalleryView: React.FC<GalleryViewProps> = ({
         )}
       </div>
 
-      {/* High-Res Liquid Glass Lightbox & Integrated Quick Editor Modal */}
-      {selectedItem && (
-        <div
-          onClick={() => setSelectedItem(null)}
-          className="fixed inset-0 bg-black/75 backdrop-blur-xl z-50 flex items-center justify-center p-4 lg:p-6"
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="liquid-glass-panel max-w-5xl w-full rounded-[28px] overflow-hidden flex flex-col max-h-[92vh]"
-          >
-            <div className="px-5 py-3.5 border-b border-white/[0.12] flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0">
-                <h3 className="text-sm font-semibold text-white truncate">
-                  {selectedItem.label}
-                </h3>
-                <p className="text-xs font-mono text-zinc-300/80 truncate">
-                  {selectedItem.width}×{selectedItem.height} · {getFilterName(selectedItem.filterId)} ·{' '}
-                  {getEffectName(selectedItem.effectId)}
-                </p>
-              </div>
+      {/* Diálogo Lightbox & Editor Integrado */}
+      <GlassDialog
+        open={selectedItem !== null}
+        onClose={() => setSelectedItem(null)}
+        title={selectedItem?.label}
+        subtitle={
+          selectedItem
+            ? `${selectedItem.width}×${selectedItem.height} · ${getFilterName(selectedItem.filterId)} · ${getEffectName(selectedItem.effectId)}`
+            : undefined
+        }
+        headerActions={
+          selectedItem && (
+            <>
+              <GlassSegmentedControl<'view' | 'edit'>
+                size="xs"
+                layoutGroupId="lightbox-mode-tabs"
+                value={editorMode}
+                onChange={setEditorMode}
+                options={[
+                  { id: 'view', label: 'Vista' },
+                  {
+                    id: 'edit',
+                    label: (
+                      <>
+                        {selectedItem.type === 'video' ? (
+                          <Scissors className="w-3 h-3" />
+                        ) : (
+                          <Sliders className="w-3 h-3" />
+                        )}
+                        <span>Editar</span>
+                      </>
+                    ),
+                  },
+                ]}
+              />
 
-              <div className="flex items-center gap-2 shrink-0">
-                <div className="liquid-segmented flex items-center gap-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setEditorMode('view')}
-                    className={`px-3 py-1 rounded-full text-xs font-medium cursor-pointer ${
-                      editorMode === 'view' ? 'liquid-segment-thumb text-white' : 'text-zinc-300'
-                    }`}
-                  >
-                    Vista
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setEditorMode('edit')}
-                    className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium cursor-pointer ${
-                      editorMode === 'edit' ? 'liquid-segment-thumb text-white' : 'text-zinc-300'
-                    }`}
-                  >
-                    {selectedItem.type === 'video' ? (
-                      <Scissors className="w-3 h-3" />
-                    ) : (
-                      <Sliders className="w-3 h-3" />
-                    )}
-                    <span>Editar</span>
-                  </button>
-                </div>
-
-                {selectedItem.type !== 'video' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onUseAsBackground(selectedItem);
-                      setSelectedItem(null);
-                    }}
-                    className="liquid-glass-btn hidden sm:inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-zinc-100 text-xs font-medium cursor-pointer"
-                  >
-                    <UserCheck className="w-3.5 h-3.5 text-emerald-300" />
-                    <span>Fondo IA</span>
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  onClick={() => handleDownload(selectedItem)}
-                  className="liquid-glass-blue inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-xs font-semibold cursor-pointer"
+              {selectedItem.type !== 'video' && (
+                <GlassButton
+                  size="sm"
+                  className="hidden sm:inline-flex"
+                  onClick={() => {
+                    onUseAsBackground(selectedItem);
+                    setSelectedItem(null);
+                  }}
+                  leadingIcon={<UserCheck className="w-3.5 h-3.5 text-emerald-500 dark:text-emerald-300" />}
                 >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Descargar</span>
-                </button>
+                  Fondo IA
+                </GlassButton>
+              )}
 
-                <button
-                  type="button"
-                  onClick={() => setSelectedItem(null)}
-                  className="liquid-glass-btn w-8 h-8 rounded-full flex items-center justify-center text-zinc-200 hover:text-white cursor-pointer"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-
-            <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
-              {/* Media Stage */}
-              <div className="flex-1 bg-black/85 flex items-center justify-center p-4 min-h-0 overflow-hidden">
-                {selectedItem.type === 'video' ? (
-                  <video
-                    ref={lightboxVideoRef}
-                    src={selectedItem.url}
-                    controls
-                    autoPlay={editorMode === 'view'}
-                    onLoadedMetadata={(e) => {
-                      const d = e.currentTarget.duration || selectedItem.durationSec || 0;
-                      setVideoDuration(d);
-                      if (trimEnd === 0 || trimEnd > d) setTrimEnd(d);
-                    }}
-                    onTimeUpdate={(e) => setVideoCurrentTime(e.currentTarget.currentTime)}
-                    className="max-h-full max-w-full rounded-2xl"
-                  />
-                ) : editorMode === 'edit' ? (
-                  <canvas
-                    ref={editCanvasRef}
-                    className="max-h-full max-w-full object-contain rounded-2xl shadow-2xl"
-                  />
-                ) : (
-                  <img
-                    src={selectedItem.url}
-                    alt={selectedItem.label}
-                    referrerPolicy="no-referrer"
-                    className="max-h-full max-w-full object-contain rounded-2xl"
-                  />
-                )}
-              </div>
-
-              {/* Editor Side Panel */}
-              {editorMode === 'edit' && (
-                <div className="w-full lg:w-[320px] border-t lg:border-t-0 lg:border-l border-white/[0.12] p-4 overflow-y-auto studio-scroll space-y-4 shrink-0">
-                  {selectedItem.type === 'video' ? (
-                    <>
-                      <div className="space-y-2.5">
-                        <h4 className="text-xs font-semibold text-white flex items-center gap-2">
-                          <Camera className="w-3.5 h-3.5 text-amber-300" />
-                          <span>Extraer Fotograma HD</span>
-                        </h4>
-                        <p className="text-[11px] text-zinc-300/75">
-                          Pausa el video en el instante exacto ({videoCurrentTime.toFixed(1)}s) y guárdalo como foto PNG.
-                        </p>
-                        <button
-                          type="button"
-                          onClick={() => void handleExtractVideoFrame()}
-                          className="liquid-glass-btn w-full py-2 px-3 rounded-full text-xs font-medium text-white cursor-pointer"
-                        >
-                          Guardar fotograma actual (PNG)
-                        </button>
-                      </div>
-
-                      <div className="liquid-divider" />
-
-                      <div className="space-y-3">
-                        <h4 className="text-xs font-semibold text-white flex items-center gap-2">
-                          <Scissors className="w-3.5 h-3.5 text-sky-300" />
-                          <span>Recortar Tiempo del Clip</span>
-                        </h4>
-
-                        <div className="space-y-1.5">
-                          <div className="flex justify-between text-[11px] text-zinc-300">
-                            <span>Inicio</span>
-                            <span className="font-mono">{trimStart.toFixed(1)}s</span>
-                          </div>
-                          <input
-                            type="range"
-                            min={0}
-                            max={Math.max(0.5, videoDuration - 0.3)}
-                            step={0.1}
-                            value={trimStart}
-                            onChange={(e) => {
-                              const val = parseFloat(e.target.value);
-                              setTrimStart(val);
-                              if (trimEnd <= val + 0.3) {
-                                setTrimEnd(Math.min(videoDuration, val + 0.5));
-                              }
-                            }}
-                            className="w-full studio-slider"
-                          />
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <div className="flex justify-between text-[11px] text-zinc-300">
-                            <span>Fin</span>
-                            <span className="font-mono">{trimEnd.toFixed(1)}s</span>
-                          </div>
-                          <input
-                            type="range"
-                            min={Math.min(videoDuration, trimStart + 0.3)}
-                            max={Math.max(0.5, videoDuration)}
-                            step={0.1}
-                            value={trimEnd}
-                            onChange={(e) => setTrimEnd(parseFloat(e.target.value))}
-                            className="w-full studio-slider"
-                          />
-                        </div>
-
-                        <div className="grid grid-cols-2 gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => setTrimStart(Math.min(videoCurrentTime, Math.max(0, trimEnd - 0.3)))}
-                            className="liquid-glass-btn py-1.5 px-2 rounded-full text-[11px] text-zinc-200 cursor-pointer"
-                          >
-                            Inicio aquí
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setTrimEnd(Math.max(videoCurrentTime, trimStart + 0.3))}
-                            className="liquid-glass-btn py-1.5 px-2 rounded-full text-[11px] text-zinc-200 cursor-pointer"
-                          >
-                            Fin aquí
-                          </button>
-                        </div>
-
-                        <button
-                          type="button"
-                          disabled={trimmingProgress !== null || videoDuration <= 0}
-                          onClick={() => void handleTrimVideo()}
-                          className="liquid-glass-blue w-full py-2.5 px-4 rounded-full text-xs font-semibold disabled:opacity-50 cursor-pointer"
-                        >
-                          {trimmingProgress !== null
-                            ? `Exportando recorte (${trimmingProgress}%)...`
-                            : `Recortar y Guardar (${Math.max(0.1, trimEnd - trimStart).toFixed(1)}s)`}
-                        </button>
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      {/* Crop & Rotate */}
-                      <div className="space-y-2.5">
-                        <div className="flex items-center justify-between">
-                          <h4 className="text-xs font-semibold text-white flex items-center gap-2">
-                            <Crop className="w-3.5 h-3.5 text-sky-300" />
-                            <span>Recorte y Rotación</span>
-                          </h4>
-                          <button
-                            type="button"
-                            onClick={() => setEditRotation((r) => ((r + 90) % 360) as RotationDeg)}
-                            className="liquid-glass-btn inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] text-zinc-100 cursor-pointer"
-                          >
-                            <RotateCw className="w-3 h-3" />
-                            <span>{editRotation}°</span>
-                          </button>
-                        </div>
-
-                        <div className="liquid-segmented grid grid-cols-5 gap-0.5">
-                          {(
-                            [
-                              { id: 'free', label: 'Libre' },
-                              { id: '16:9', label: '16:9' },
-                              { id: '4:3', label: '4:3' },
-                              { id: '1:1', label: '1:1' },
-                              { id: '9:16', label: '9:16' },
-                            ] as { id: CropAspectPreset; label: string }[]
-                          ).map((p) => (
-                            <button
-                              key={p.id}
-                              type="button"
-                              onClick={() => setCropPreset(p.id)}
-                              className={`py-1 rounded-full text-[10px] font-mono cursor-pointer ${
-                                cropPreset === p.id
-                                  ? 'liquid-segment-thumb text-white'
-                                  : 'text-zinc-300/75'
-                              }`}
-                            >
-                              {p.label}
-                            </button>
-                          ))}
-                        </div>
-
-                        <div className="space-y-1">
-                          <div className="flex justify-between text-[11px] text-zinc-300">
-                            <span>Tamaño de recorte</span>
-                            <span className="font-mono">{cropScale}%</span>
-                          </div>
-                          <input
-                            type="range"
-                            min={30}
-                            max={100}
-                            value={cropScale}
-                            onChange={(e) => setCropScale(parseInt(e.target.value, 10))}
-                            className="w-full studio-slider"
-                          />
-                        </div>
-
-                        <div className="grid grid-cols-2 gap-2">
-                          <div className="space-y-1">
-                            <span className="text-[11px] text-zinc-300">Posición X</span>
-                            <input
-                              type="range"
-                              min={0}
-                              max={100}
-                              value={cropCenterX}
-                              onChange={(e) => setCropCenterX(parseInt(e.target.value, 10))}
-                              className="w-full studio-slider"
-                            />
-                          </div>
-                          <div className="space-y-1">
-                            <span className="text-[11px] text-zinc-300">Posición Y</span>
-                            <input
-                              type="range"
-                              min={0}
-                              max={100}
-                              value={cropCenterY}
-                              onChange={(e) => setCropCenterY(parseInt(e.target.value, 10))}
-                              className="w-full studio-slider"
-                            />
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="liquid-divider" />
-
-                      {/* Post-capture Filter & Tone */}
-                      <div className="space-y-2.5">
-                        <h4 className="text-xs font-semibold text-white">Filtro y Ajustes</h4>
-                        <div className="grid grid-cols-3 gap-1.5">
-                          {FILTER_PRESETS.map((preset) => (
-                            <button
-                              key={preset.id}
-                              type="button"
-                              onClick={() => setEditFilterId(preset.id)}
-                              className={`p-1.5 rounded-xl text-left cursor-pointer ${
-                                editFilterId === preset.id
-                                  ? 'liquid-glass-btn-active'
-                                  : 'liquid-glass-btn'
-                              }`}
-                            >
-                              <div
-                                className={`h-4 rounded-md bg-gradient-to-br ${preset.swatchGradient} mb-1`}
-                              />
-                              <div className="text-[10px] text-white truncate">{preset.name}</div>
-                            </button>
-                          ))}
-                        </div>
-
-                        <div className="space-y-1">
-                          <div className="flex justify-between text-[11px] text-zinc-300">
-                            <span>Brillo</span>
-                            <span className="font-mono">{editBrightness}</span>
-                          </div>
-                          <input
-                            type="range"
-                            min={-40}
-                            max={40}
-                            value={editBrightness}
-                            onChange={(e) => setEditBrightness(parseInt(e.target.value, 10))}
-                            className="w-full studio-slider"
-                          />
-                        </div>
-
-                        <div className="space-y-1">
-                          <div className="flex justify-between text-[11px] text-zinc-300">
-                            <span>Contraste</span>
-                            <span className="font-mono">{editContrast}</span>
-                          </div>
-                          <input
-                            type="range"
-                            min={-40}
-                            max={40}
-                            value={editContrast}
-                            onChange={(e) => setEditContrast(parseInt(e.target.value, 10))}
-                            className="w-full studio-slider"
-                          />
-                        </div>
-
-                        <div className="space-y-1">
-                          <div className="flex justify-between text-[11px] text-zinc-300">
-                            <span>Saturación</span>
-                            <span className="font-mono">{editSaturation}</span>
-                          </div>
-                          <input
-                            type="range"
-                            min={-80}
-                            max={80}
-                            value={editSaturation}
-                            onChange={(e) => setEditSaturation(parseInt(e.target.value, 10))}
-                            className="w-full studio-slider"
-                          />
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-2 pt-1">
-                        <button
-                          type="button"
-                          disabled={savingImageEdit}
-                          onClick={() => void handleCommitImageEdit(false)}
-                          className="liquid-glass-blue py-2 px-3 rounded-full text-xs font-semibold cursor-pointer"
-                        >
-                          Guardar copia
-                        </button>
-                        <button
-                          type="button"
-                          disabled={savingImageEdit}
-                          onClick={() => void handleCommitImageEdit(true)}
-                          className="liquid-glass-btn py-2 px-3 rounded-full text-xs font-medium text-white cursor-pointer"
-                        >
-                          Reemplazar
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </div>
+              <GlassButton
+                variant="primary"
+                size="sm"
+                onClick={() => handleDownload(selectedItem)}
+                leadingIcon={<Download className="w-3.5 h-3.5" />}
+              >
+                Descargar
+              </GlassButton>
+            </>
+          )
+        }
+      >
+        {selectedItem && (
+          <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
+            <div className="flex-1 bg-black flex items-center justify-center p-4 min-h-0 overflow-hidden">
+              {selectedItem.type === 'video' ? (
+                <video
+                  ref={lightboxVideoRef}
+                  src={selectedItem.url}
+                  controls
+                  autoPlay={editorMode === 'view'}
+                  onLoadedMetadata={(e) => {
+                    const d = e.currentTarget.duration || selectedItem.durationSec || 0;
+                    setVideoDuration(d);
+                    if (trimEnd === 0 || trimEnd > d) setTrimEnd(d);
+                  }}
+                  onTimeUpdate={(e) => setVideoCurrentTime(e.currentTarget.currentTime)}
+                  className="max-h-full max-w-full rounded-2xl"
+                />
+              ) : editorMode === 'edit' ? (
+                <canvas
+                  ref={editCanvasRef}
+                  className="max-h-full max-w-full object-contain rounded-2xl shadow-2xl"
+                />
+              ) : (
+                <img
+                  src={selectedItem.url}
+                  alt={selectedItem.label}
+                  referrerPolicy="no-referrer"
+                  className="max-h-full max-w-full object-contain rounded-2xl"
+                />
               )}
             </div>
+
+            {editorMode === 'edit' && (
+              <div className="w-full lg:w-[320px] border-t lg:border-t-0 lg:border-l border-[var(--border-hairline)] p-4 overflow-y-auto studio-scroll space-y-4 shrink-0">
+                {selectedItem.type === 'video' ? (
+                  <>
+                    <div className="space-y-2.5">
+                      <h4 className="text-xs font-semibold text-[var(--text-primary)] flex items-center gap-2">
+                        <Camera className="w-3.5 h-3.5 text-[var(--accent-amber)]" />
+                        <span>Extraer Fotograma HD</span>
+                      </h4>
+                      <p className="text-[11px] text-[var(--text-tertiary)]">
+                        Pausa el video en el instante exacto ({videoCurrentTime.toFixed(1)}s) y guárdalo como foto PNG.
+                      </p>
+                      <GlassButton
+                        size="sm"
+                        className="w-full"
+                        onClick={() => void handleExtractVideoFrame()}
+                      >
+                        Guardar fotograma actual (PNG)
+                      </GlassButton>
+                    </div>
+
+                    <div className="liquid-divider" />
+
+                    <div className="space-y-3">
+                      <h4 className="text-xs font-semibold text-[var(--text-primary)] flex items-center gap-2">
+                        <Scissors className="w-3.5 h-3.5 text-[var(--accent-blue)]" />
+                        <span>Recortar Tiempo del Clip</span>
+                      </h4>
+
+                      <GlassSlider
+                        label="Inicio"
+                        min={0}
+                        max={Math.max(0.5, videoDuration - 0.3)}
+                        step={0.1}
+                        value={trimStart}
+                        displayValue={`${trimStart.toFixed(1)}s`}
+                        onChange={(val) => {
+                          setTrimStart(val);
+                          if (trimEnd <= val + 0.3) {
+                            setTrimEnd(Math.min(videoDuration, val + 0.5));
+                          }
+                        }}
+                      />
+
+                      <GlassSlider
+                        label="Fin"
+                        min={Math.min(videoDuration, trimStart + 0.3)}
+                        max={Math.max(0.5, videoDuration)}
+                        step={0.1}
+                        value={trimEnd}
+                        displayValue={`${trimEnd.toFixed(1)}s`}
+                        onChange={setTrimEnd}
+                      />
+
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <GlassButton
+                          size="xs"
+                          onClick={() =>
+                            setTrimStart(Math.min(videoCurrentTime, Math.max(0, trimEnd - 0.3)))
+                          }
+                        >
+                          Inicio aquí
+                        </GlassButton>
+                        <GlassButton
+                          size="xs"
+                          onClick={() =>
+                            setTrimEnd(Math.max(videoCurrentTime, trimStart + 0.3))
+                          }
+                        >
+                          Fin aquí
+                        </GlassButton>
+                      </div>
+
+                      <GlassButton
+                        variant="primary"
+                        size="md"
+                        className="w-full"
+                        loading={trimmingProgress !== null}
+                        disabled={trimmingProgress !== null || videoDuration <= 0}
+                        onClick={() => void handleTrimVideo()}
+                      >
+                        {trimmingProgress !== null
+                          ? `Exportando (${trimmingProgress}%)`
+                          : `Recortar (${Math.max(0.1, trimEnd - trimStart).toFixed(1)}s)`}
+                      </GlassButton>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-[var(--text-primary)] flex items-center gap-2">
+                          <Crop className="w-3.5 h-3.5 text-[var(--accent-blue)]" />
+                          <span>Recorte y Rotación</span>
+                        </h4>
+                        <GlassButton
+                          size="xs"
+                          onClick={() => setEditRotation((r) => ((r + 90) % 360) as RotationDeg)}
+                          leadingIcon={<RotateCw className="w-3 h-3" />}
+                        >
+                          {editRotation}°
+                        </GlassButton>
+                      </div>
+
+                      <GlassSegmentedControl<CropAspectPreset>
+                        fullWidth
+                        size="xs"
+                        layoutGroupId="lightbox-crop-presets"
+                        value={cropPreset}
+                        onChange={setCropPreset}
+                        options={[
+                          { id: 'free', label: 'Libre' },
+                          { id: '16:9', label: '16:9' },
+                          { id: '4:3', label: '4:3' },
+                          { id: '1:1', label: '1:1' },
+                          { id: '9:16', label: '9:16' },
+                        ]}
+                      />
+
+                      <GlassSlider
+                        label="Tamaño de recorte"
+                        min={30}
+                        max={100}
+                        value={cropScale}
+                        displayValue={`${cropScale}%`}
+                        onChange={(v) => setCropScale(Math.round(v))}
+                        onReset={() => setCropScale(100)}
+                      />
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <GlassSlider
+                          label="Posición X"
+                          min={0}
+                          max={100}
+                          value={cropCenterX}
+                          displayValue={`${cropCenterX}%`}
+                          onChange={(v) => setCropCenterX(Math.round(v))}
+                          onReset={() => setCropCenterX(50)}
+                        />
+                        <GlassSlider
+                          label="Posición Y"
+                          min={0}
+                          max={100}
+                          value={cropCenterY}
+                          displayValue={`${cropCenterY}%`}
+                          onChange={(v) => setCropCenterY(Math.round(v))}
+                          onReset={() => setCropCenterY(50)}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="liquid-divider" />
+
+                    <div className="space-y-2.5">
+                      <h4 className="text-xs font-semibold text-[var(--text-primary)]">
+                        Filtro y Ajustes
+                      </h4>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {FILTER_PRESETS.map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onClick={() => setEditFilterId(preset.id)}
+                            className={`glass-focus-ring p-1 rounded-xl border text-left transition-colors cursor-pointer ${
+                              editFilterId === preset.id
+                                ? 'bg-[var(--control-active-bg)] border-[var(--control-active-border)]'
+                                : 'border-transparent hover:bg-[var(--studio-surface-subtle)]'
+                            }`}
+                          >
+                            <div
+                              className={`h-4 rounded-md bg-gradient-to-br ${preset.swatchGradient} mb-1`}
+                            />
+                            <div className="text-[10px] text-[var(--text-primary)] truncate">
+                              {preset.name}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+
+                      <GlassSlider
+                        label="Brillo"
+                        min={-40}
+                        max={40}
+                        value={editBrightness}
+                        onChange={(v) => setEditBrightness(Math.round(v))}
+                        onReset={() => setEditBrightness(0)}
+                      />
+                      <GlassSlider
+                        label="Contraste"
+                        min={-40}
+                        max={40}
+                        value={editContrast}
+                        onChange={(v) => setEditContrast(Math.round(v))}
+                        onReset={() => setEditContrast(0)}
+                      />
+                      <GlassSlider
+                        label="Saturación"
+                        min={-80}
+                        max={80}
+                        value={editSaturation}
+                        onChange={(v) => setEditSaturation(Math.round(v))}
+                        onReset={() => setEditSaturation(0)}
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <GlassButton
+                        variant="primary"
+                        size="sm"
+                        loading={savingImageEdit}
+                        onClick={() => void handleCommitImageEdit(false)}
+                      >
+                        Guardar copia
+                      </GlassButton>
+                      <GlassButton
+                        size="sm"
+                        loading={savingImageEdit}
+                        onClick={() => void handleCommitImageEdit(true)}
+                      >
+                        Reemplazar
+                      </GlassButton>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </GlassDialog>
+
+      {/* Diálogo de confirmación para vaciar galería */}
+      <GlassDialog
+        open={confirmClearOpen}
+        onClose={() => setConfirmClearOpen(false)}
+        title="Vaciar galería local"
+        subtitle={`${items.length} elementos guardados`}
+        maxWidthClass="max-w-md"
+      >
+        <div className="p-5 space-y-4">
+          <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
+            Se eliminarán permanentemente todas las fotografías y grabaciones almacenadas en la base local de la galería.
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <GlassButton size="sm" onClick={() => setConfirmClearOpen(false)}>
+              Cancelar
+            </GlassButton>
+            <GlassButton
+              variant="danger"
+              size="sm"
+              onClick={() => {
+                onClearAll();
+                setConfirmClearOpen(false);
+              }}
+            >
+              Vaciar galería
+            </GlassButton>
           </div>
         </div>
-      )}
+      </GlassDialog>
     </section>
   );
 };

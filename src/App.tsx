@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TopBar } from './components/TopBar';
+import { LeftStudioPanel } from './components/LeftStudioPanel';
 import { CameraViewport } from './components/CameraViewport';
-import { SidebarControls } from './components/SidebarControls';
+import { SidebarControls, type StudioEnginePanelProps } from './components/SidebarControls';
 import { GalleryView } from './components/GalleryView';
 import {
   DEFAULT_ADJUSTMENTS,
@@ -41,7 +42,7 @@ import {
   computeMotionScore,
   getAlignedRawCanvas,
   renderCameraFrame,
-  renderSyntheticCameraFeed,
+  renderUnavailableCameraFrame,
   triggerBackgroundCalibration,
   type HistogramData,
 } from './utils/canvasProcessor';
@@ -60,6 +61,14 @@ import {
   loadAllMediaItems,
   saveMediaItem,
 } from './utils/storage';
+import {
+  readPersistedEngineMode,
+  type EngineMode,
+} from './engine/engineCompatibility';
+import type { PreferredCompositorBackend } from './engine/studioCoordinator';
+import type { MediaStreamLike } from './engine/sourceManager';
+import { useStudioEngine } from './hooks/useStudioEngine';
+import { useAppearance } from './hooks/useAppearance';
 
 function getDimensions(
   preset: ResolutionPresetId,
@@ -142,9 +151,11 @@ export default function App() {
   const initialPrefs = useMemo(() => loadSavedPrefs(), []);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('studio');
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [cinemaMode, setCinemaMode] = useState(false);
+  const [studioLabOpen, setStudioLabOpen] = useState(false);
 
   // Streams & Hardware
-  const [cameraStatus, setCameraStatus] = useState<'idle' | 'live' | 'demo' | 'error'>('idle');
+  const [cameraStatus, setCameraStatus] = useState<'idle' | 'live' | 'error'>('idle');
   const [cameraErrorMsg, setCameraErrorMsg] = useState<string | null>(null);
   const [cameraLabel, setCameraLabel] = useState<string>('FaceTime HD');
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
@@ -232,6 +243,7 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [isRecordingPaused, setIsRecordingPaused] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const appearance = useAppearance(isRecording);
   const [recordingFormatPref, setRecordingFormatPref] = useState<RecordingFormatPref>(
     initialPrefs.recordingFormatPref || 'auto-mp4'
   );
@@ -301,7 +313,9 @@ export default function App() {
   const screenVideoElRef = useRef<HTMLVideoElement | null>(null);
   const secondaryVideoElRef = useRef<HTMLVideoElement | null>(null);
   const outputPipVideoRef = useRef<HTMLVideoElement | null>(null);
-  const syntheticCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const unavailableCameraCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const processedCameraCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const processedCameraVersionRef = useRef<number>(0);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const secondaryStreamRef = useRef<MediaStream | null>(null);
@@ -319,6 +333,50 @@ export default function App() {
     data: Uint8Array<ArrayBuffer>;
   } | null>(null);
 
+  const initialEngineMode = useMemo(() => readPersistedEngineMode(), []);
+  const showToast = useCallback((msg: string) => {
+    setToastMsg(msg);
+    setTimeout(() => {
+      setToastMsg((prev) => (prev === msg ? null : prev));
+    }, 2600);
+  }, []);
+
+  const studioEngine = useStudioEngine({
+    resolutionPreset,
+    aspectRatio,
+    fps: 30,
+    initialMode: initialEngineMode,
+    persistModePreference: true,
+    onRecordingSafetyStop: (reason) => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          // Ignore stop errors
+        }
+      }
+      setIsRecording(false);
+      setIsRecordingPaused(false);
+      showToast(reason);
+    },
+  });
+
+  const engineModeRef = useRef<EngineMode>(studioEngine.engineMode);
+  engineModeRef.current = studioEngine.engineMode;
+  const studioEngineRef = useRef(studioEngine);
+  studioEngineRef.current = studioEngine;
+
+  useEffect(() => {
+    studioEngine.setRecordingLocked(isRecording);
+  }, [isRecording, studioEngine.setRecordingLocked]);
+
+  const getOutputCaptureCanvas = useCallback((): HTMLCanvasElement | null => {
+    if (engineModeRef.current === 'studio') {
+      return studioEngineRef.current.getProgramCanvas() ?? canvasRef.current;
+    }
+    return canvasRef.current;
+  }, []);
+
   const dims = useMemo(
     () => getDimensions(resolutionPreset, aspectRatio, sensorSize),
     [resolutionPreset, aspectRatio, sensorSize]
@@ -328,13 +386,6 @@ export default function App() {
     () => typeof window !== 'undefined' && 'BarcodeDetector' in window,
     []
   );
-
-  const showToast = useCallback((msg: string) => {
-    setToastMsg(msg);
-    setTimeout(() => {
-      setToastMsg((prev) => (prev === msg ? null : prev));
-    }, 2600);
-  }, []);
 
   // Load persisted gallery items on mount
   useEffect(() => {
@@ -550,8 +601,8 @@ export default function App() {
       targetAspect: AspectRatioId = aspectRatio
     ) => {
       if (!navigator.mediaDevices?.getUserMedia) {
-        setCameraStatus('demo');
-        setCameraErrorMsg('Navegador sin soporte de cámara WebRTC. Usando Modo Demo Óptico.');
+        setCameraStatus('error');
+        setCameraErrorMsg('La cámara no está disponible en este entorno.');
         return;
       }
 
@@ -660,21 +711,25 @@ export default function App() {
         setCameraStatus('live');
         setCameraErrorMsg(null);
       } catch (err) {
-        // Fallback smoothly to demo optical mode if permission denied or no camera attached
-        setCameraStatus('demo');
+        // Report camera errors without synthetic camera content
+        setCameraStatus('error');
         const msg =
           err instanceof Error && err.name === 'NotAllowedError'
-            ? 'Permiso de cámara denegado. Puedes usar el Modo Demo o habilitar el permiso en tu navegador.'
-            : 'No se detectó cámara activa. Mostrando Modo Demo Óptico.';
+            ? 'Permiso de cámara denegado. Revisa Privacidad y seguridad de macOS.'
+            : 'No se detectó una cámara activa. Conecta o selecciona una cámara.';
         setCameraErrorMsg(msg);
       }
     },
     [aspectRatio, refreshDevices, resolutionPreset, setupAudioAnalyser]
   );
 
-  // Initialize camera on mount
+  // Initialize camera on mount only when starting in Legacy mode (no race with Studio Engine)
   useEffect(() => {
-    startCameraStream();
+    if (initialEngineMode !== 'studio') {
+      startCameraStream();
+    } else {
+      void refreshDevices();
+    }
     return () => {
       mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -683,6 +738,36 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Sync camera/audio UI status when Studio Engine owns live hardware
+  useEffect(() => {
+    if (studioEngine.engineMode !== 'studio') return;
+    if (studioEngine.hasLiveCameraSource) {
+      setCameraStatus('live');
+      setCameraErrorMsg(null);
+      const vid = studioEngine.getActiveCameraVideoElement();
+      if (vid && vid.videoWidth > 0 && vid.videoHeight > 0) {
+        setSensorSize({ w: vid.videoWidth, h: vid.videoHeight });
+      }
+      void refreshDevices();
+    } else if (cameraStatus === 'live') {
+      setCameraStatus('idle');
+    }
+    if (!audioAnalyserRef.current) {
+      const tracks = studioEngine.getActiveAudioMediaTracks();
+      if (tracks.length > 0 && typeof MediaStream !== 'undefined') {
+        setupAudioAnalyser(new MediaStream(tracks));
+      }
+    }
+  }, [
+    studioEngine.engineMode,
+    studioEngine.hasLiveCameraSource,
+    studioEngine.sources,
+    cameraStatus,
+    refreshDevices,
+    setupAudioAnalyser,
+    studioEngine,
+  ]);
 
   // Apply hardware focus constraints if supported by MacBook/USB camera
   useEffect(() => {
@@ -722,6 +807,9 @@ export default function App() {
         t.enabled = !micMuted;
       });
     }
+    for (const track of studioEngine.getActiveAudioMediaTracks()) {
+      track.enabled = !micMuted;
+    }
     const graph = audioAnalyserRef.current;
     if (graph) {
       const targetGain = micMuted ? 0 : Math.max(0, Math.min(2, audioConsole.micGain / 100));
@@ -738,7 +826,7 @@ export default function App() {
         graph.compressorNode.ratio.setValueAtTime(1, graph.ctx.currentTime);
       }
     }
-  }, [micMuted, audioConsole.micGain, audioConsole.compressorEnabled]);
+  }, [micMuted, audioConsole.micGain, audioConsole.compressorEnabled, studioEngine]);
 
   // Dual Camera simultaneous stream lifecycle
   useEffect(() => {
@@ -855,13 +943,13 @@ export default function App() {
     return () => clearInterval(id);
   }, [micMuted, isScreenPipActive]);
 
-  // Capture Single Filtered Frame Helper
+  // Capture Single Filtered Frame Helper (reads clean ProgramCanvas in Studio mode)
   const captureCurrentCanvasItem = useCallback(
     async (
       customLabel?: string,
       type: 'photo' | 'booth' = 'photo'
     ): Promise<CapturedMediaItem | null> => {
-      const canvas = canvasRef.current;
+      const canvas = getOutputCaptureCanvas();
       if (!canvas) return null;
 
       const blob = await new Promise<Blob | null>((resolve) =>
@@ -893,7 +981,7 @@ export default function App() {
       await saveMediaItem(item);
       return item;
     },
-    [filterId, effectId]
+    [filterId, effectId, getOutputCaptureCanvas]
   );
 
   // Trigger single shot with optional timer & flash
@@ -945,11 +1033,12 @@ export default function App() {
         playShutterSound(soundMuted);
         setFlashActive(false);
 
-        if (canvasRef.current) {
+        const activeCaptureCanvas = getOutputCaptureCanvas();
+        if (activeCaptureCanvas) {
           const snap = document.createElement('canvas');
-          snap.width = canvasRef.current.width;
-          snap.height = canvasRef.current.height;
-          snap.getContext('2d')?.drawImage(canvasRef.current, 0, 0);
+          snap.width = activeCaptureCanvas.width;
+          snap.height = activeCaptureCanvas.height;
+          snap.getContext('2d')?.drawImage(activeCaptureCanvas, 0, 0);
           frames.push(snap);
         }
         await new Promise((r) => setTimeout(r, 400));
@@ -1008,7 +1097,7 @@ export default function App() {
         }
       }
     },
-    [boothProgress, soundMuted, flashEnabled, filterId, effectId, showToast]
+    [boothProgress, soundMuted, flashEnabled, filterId, effectId, getOutputCaptureCanvas, showToast]
   );
 
   // Burst Capture (5 rapid shots)
@@ -1044,21 +1133,26 @@ export default function App() {
       return;
     }
 
-    const canvas = canvasRef.current;
+    const canvas = getOutputCaptureCanvas();
     if (!canvas || typeof MediaRecorder === 'undefined') {
       showToast('Grabación de video no soportada en este navegador');
       return;
     }
 
-    const canvasStream = canvas.captureStream(60);
+    const captureFps = engineModeRef.current === 'studio' ? 30 : 60;
+    const canvasStream = canvas.captureStream(captureFps);
     const combinedTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
     if (audioAnalyserRef.current) {
       if (audioAnalyserRef.current.ctx.state === 'suspended') {
         void audioAnalyserRef.current.ctx.resume();
       }
       combinedTracks.push(...audioAnalyserRef.current.dest.stream.getAudioTracks());
-    } else if (mediaStreamRef.current && !micMuted) {
-      combinedTracks.push(...mediaStreamRef.current.getAudioTracks());
+    } else if (!micMuted) {
+      const fallbackAudioTracks =
+        engineModeRef.current === 'studio'
+          ? studioEngineRef.current.getActiveAudioMediaTracks()
+          : mediaStreamRef.current?.getAudioTracks() ?? [];
+      combinedTracks.push(...fallbackAudioTracks);
     }
     const combinedStream = new MediaStream(combinedTracks);
 
@@ -1132,7 +1226,7 @@ export default function App() {
     } catch {
       showToast('No se pudo iniciar la grabación de video');
     }
-  }, [isRecording, micMuted, recordingFormatPref, filterId, effectId, showToast]);
+  }, [isRecording, micMuted, recordingFormatPref, filterId, effectId, getOutputCaptureCanvas, showToast]);
 
   const togglePauseRecording = useCallback(() => {
     const rec = mediaRecorderRef.current;
@@ -1155,8 +1249,40 @@ export default function App() {
     return () => clearInterval(id);
   }, [isRecording, isRecordingPaused]);
 
+  const routeDisplayAudioToMixer = useCallback((sStream: MediaStream) => {
+    if (sStream.getAudioTracks().length === 0 || !audioAnalyserRef.current) return;
+    const graph = audioAnalyserRef.current;
+    if (graph.screenAudioSource) {
+      try {
+        graph.screenAudioSource.disconnect();
+      } catch {
+        // Ignore
+      }
+      graph.screenAudioSource = undefined;
+    }
+    try {
+      const sSrc = graph.ctx.createMediaStreamSource(sStream);
+      sSrc.connect(graph.analyser);
+      sSrc.connect(graph.dest);
+      graph.screenAudioSource = sSrc;
+    } catch {
+      // Ignore if display stream audio track cannot be routed
+    }
+  }, []);
+
   // Screen Share + Camera PiP (+ optional shared system/tab audio into Web Audio mixer)
   const toggleScreenPip = useCallback(async () => {
+    if (engineModeRef.current === 'studio') {
+      const entry = await studioEngineRef.current.authorizeDisplaySource();
+      if (entry?.state.status === 'live' && entry.resources.mediaStream) {
+        routeDisplayAudioToMixer(entry.resources.mediaStream as MediaStream);
+        showToast('Pantalla o ventana conectada');
+      } else {
+        showToast(entry?.state.errorMessage || 'No se pudo conectar la pantalla. Selecciona una escena de Tutorial PiP o Solo Pantalla y comprueba los permisos de macOS.');
+      }
+      return;
+    }
+
     if (isScreenPipActive) {
       if (audioAnalyserRef.current?.screenAudioSource) {
         try {
@@ -1193,17 +1319,7 @@ export default function App() {
       screenVideoElRef.current.srcObject = sStream;
       await screenVideoElRef.current.play();
 
-      if (sStream.getAudioTracks().length > 0 && audioAnalyserRef.current) {
-        const graph = audioAnalyserRef.current;
-        try {
-          const sSrc = graph.ctx.createMediaStreamSource(sStream);
-          sSrc.connect(graph.analyser);
-          sSrc.connect(graph.dest);
-          graph.screenAudioSource = sSrc;
-        } catch {
-          // Ignore if display stream audio track cannot be routed
-        }
-      }
+      routeDisplayAudioToMixer(sStream);
 
       sStream.getVideoTracks()[0].onended = () => {
         if (audioAnalyserRef.current?.screenAudioSource) {
@@ -1218,10 +1334,18 @@ export default function App() {
         screenStreamRef.current = null;
       };
       setIsScreenPipActive(true);
-    } catch {
-      // User cancelled screen share picker
+    } catch (err) {
+      const name = err instanceof Error ? err.name : 'Error';
+      console.warn('[Optica] Display capture:', name);
+      screenStreamRef.current?.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current = null;
+      if (screenVideoElRef.current) screenVideoElRef.current.srcObject = null;
+      setIsScreenPipActive(false);
+      showToast(name === 'NotAllowedError'
+        ? 'Captura cancelada o permiso denegado. Revisa Privacidad y seguridad → Grabación de pantalla y audio del sistema.'
+        : `No se pudo compartir pantalla (${name}). Intenta nuevamente.`);
     }
-  }, [isScreenPipActive, audioConsole.includeSystemAudio, showToast]);
+  }, [isScreenPipActive, audioConsole.includeSystemAudio, routeDisplayAudioToMixer, showToast]);
 
   // Native System Floating Window (Output Picture-in-Picture)
   const toggleOutputPip = useCallback(async () => {
@@ -1239,7 +1363,7 @@ export default function App() {
       return;
     }
 
-    const canvas = canvasRef.current;
+    const canvas = getOutputCaptureCanvas();
     const vid = outputPipVideoRef.current;
     if (!canvas || !vid || typeof vid.requestPictureInPicture !== 'function') {
       showToast('No se pudo abrir la ventana flotante del monitor');
@@ -1255,7 +1379,152 @@ export default function App() {
     } catch {
       showToast('Activa permisos o haz clic de nuevo para abrir la ventana flotante');
     }
-  }, [showToast]);
+  }, [getOutputCaptureCanvas, showToast]);
+
+  const handleAuthorizeStudioDisplaySource = useCallback(async () => {
+    const entry = await studioEngine.authorizeDisplaySource();
+    if (!entry || entry.state.status !== 'live') {
+      showToast(entry?.state.errorMessage || 'No hay una fuente de pantalla disponible en la escena. Selecciona Tutorial PiP o Solo Pantalla.');
+      return;
+    }
+    const stream = entry.resources.mediaStream as MediaStream | null;
+    if (stream && stream.getAudioTracks().length > 0 && audioAnalyserRef.current) {
+      const graph = audioAnalyserRef.current;
+      if (graph.screenAudioSource) {
+        try {
+          graph.screenAudioSource.disconnect();
+        } catch {
+          // Ignore
+        }
+        graph.screenAudioSource = undefined;
+      }
+      try {
+        const sSrc = graph.ctx.createMediaStreamSource(stream);
+        sSrc.connect(graph.analyser);
+        sSrc.connect(graph.dest);
+        graph.screenAudioSource = sSrc;
+      } catch {
+        // Ignore routing errors
+      }
+    }
+    showToast('Pantalla o ventana conectada');
+  }, [studioEngine, showToast]);
+
+  const handleSwitchEngineMode = useCallback(
+    async (nextMode: EngineMode) => {
+      if (nextMode === studioEngine.engineMode) return;
+      if (isRecording) {
+        showToast('Detén la grabación activa antes de cambiar de motor');
+        return;
+      }
+
+      if (nextMode === 'studio') {
+        const camStream = mediaStreamRef.current;
+        const scrStream = screenStreamRef.current;
+
+        // Desactivar listener legacy antes de ceder la pista de ventana
+        const scrVidTrack = scrStream?.getVideoTracks()[0];
+        if (scrVidTrack) {
+          scrVidTrack.onended = null;
+        }
+
+        if (dualCam.enabled) {
+          setDualCam((p) => ({ ...p, enabled: false }));
+        }
+
+        const res = await studioEngine.activateStudioMode({
+          cameraStream: camStream as unknown as MediaStreamLike | null,
+          screenStream: scrStream as unknown as MediaStreamLike | null,
+        });
+        if (!res.ok) {
+          showToast(res.reason || 'No se pudo activar Studio Engine');
+          return;
+        }
+
+        // Entregar propiedad exclusiva de streams a SourceManager sin cerrarlos
+        mediaStreamRef.current = null;
+        screenStreamRef.current = null;
+        if (videoElRef.current) videoElRef.current.srcObject = null;
+        if (screenVideoElRef.current) screenVideoElRef.current.srcObject = null;
+        setIsScreenPipActive(false);
+        showToast('Studio Engine (Experimental) activado con ProgramCanvas');
+        return;
+      }
+
+      const res = studioEngine.deactivateStudioMode();
+      if (!res.ok) {
+        showToast(res.reason || 'No se pudo volver a Legacy Engine');
+        return;
+      }
+
+      studioEngine.setProcessedCameraSurface(null);
+      setIsScreenPipActive(false);
+
+      const handedTracks = [
+        ...(res.handedBackCameraTracks ?? []),
+        ...(res.handedBackMicTracks ?? []),
+      ] as unknown as MediaStreamTrack[];
+
+      if (handedTracks.length > 0 && typeof MediaStream !== 'undefined') {
+        const restored = new MediaStream(handedTracks);
+        mediaStreamRef.current = restored;
+        if ((res.handedBackCameraTracks?.length ?? 0) > 0) {
+          if (!videoElRef.current) {
+            const v = document.createElement('video');
+            v.playsInline = true;
+            v.muted = true;
+            videoElRef.current = v;
+          }
+          videoElRef.current.srcObject = restored;
+          await videoElRef.current.play().catch(() => {});
+          setCameraStatus('live');
+          setCameraErrorMsg(null);
+        } else {
+          setCameraStatus('error');
+        }
+        if (!audioAnalyserRef.current && (res.handedBackMicTracks?.length ?? 0) > 0) {
+          setupAudioAnalyser(restored);
+        }
+      } else {
+        await startCameraStream(selectedVideoId, selectedAudioId, resolutionPreset, aspectRatio);
+      }
+
+      showToast('Legacy Engine (Estable) restaurado');
+    },
+    [
+      studioEngine,
+      isRecording,
+      dualCam.enabled,
+      selectedVideoId,
+      selectedAudioId,
+      resolutionPreset,
+      aspectRatio,
+      setupAudioAnalyser,
+      startCameraStream,
+      showToast,
+    ]
+  );
+
+  const handleChangeStudioBackend = useCallback(
+    (backend: PreferredCompositorBackend) => {
+      const res = studioEngine.setBackendPreference(backend);
+      if (!res.ok) {
+        showToast(res.reason || 'No se puede cambiar el backend gráfico ahora');
+        return;
+      }
+      showToast(`Backend Studio Engine: ${backend}`);
+    },
+    [studioEngine, showToast]
+  );
+
+  const handleRecoverStudioCanvas2d = useCallback(() => {
+    const res = studioEngine.recoverLostContextWithCanvas2d();
+    showToast(
+      res.ok
+        ? 'Superficie recuperada en respaldo Canvas 2D'
+        : res.reason || 'Grabación detenida para reconstruir superficie'
+    );
+  }, [studioEngine, showToast]);
 
   useEffect(() => {
     const vid = outputPipVideoRef.current;
@@ -1510,127 +1779,251 @@ export default function App() {
     let lastQrTime = 0;
     let lastAiDetTime = 0;
     let hadSubjectsPreviously = false;
-    const startTime = performance.now();
 
-    if (!syntheticCanvasRef.current) {
-      syntheticCanvasRef.current = document.createElement('canvas');
+    if (!unavailableCameraCanvasRef.current) {
+      unavailableCameraCanvasRef.current = document.createElement('canvas');
+    }
+    if (!processedCameraCanvasRef.current) {
+      processedCameraCanvasRef.current = document.createElement('canvas');
     }
 
     const renderLoop = (now: number) => {
       const s = renderStateRef.current;
       const canvas = canvasRef.current;
+      const isStudioMode = engineModeRef.current === 'studio';
+
       if (canvas) {
         const targetW = s.dims.w;
         const targetH = s.dims.h;
 
-        if (canvas.width !== targetW || canvas.height !== targetH) {
+        if (!isStudioMode && (canvas.width !== targetW || canvas.height !== targetH)) {
           canvas.width = targetW;
           canvas.height = targetH;
         }
 
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         if (ctx && !s.frozen) {
-          let primarySource: HTMLVideoElement | HTMLCanvasElement | null = null;
-          let srcW = 1920;
-          let srcH = 1080;
+          if (isStudioMode) {
+            // Modo Studio Engine: ProgramCompositor gobierna la composición maestra sin duplicar motores.
+            const coordEngine = studioEngineRef.current;
+            const camVid = coordEngine.getActiveCameraVideoElement();
+            const camLive =
+              Boolean(camVid && camVid.readyState >= 2 && camVid.videoWidth > 0);
 
-          if (
-            s.cameraStatus === 'live' &&
-            videoElRef.current &&
-            videoElRef.current.readyState >= 2 &&
-            videoElRef.current.videoWidth > 0
-          ) {
-            primarySource = videoElRef.current;
-            srcW = videoElRef.current.videoWidth;
-            srcH = videoElRef.current.videoHeight;
-            if (
-              srcW !== lastKnownSensorRef.current.w ||
-              srcH !== lastKnownSensorRef.current.h
-            ) {
-              lastKnownSensorRef.current = { w: srcW, h: srcH };
-              setSensorSize({ w: srcW, h: srcH });
+            if (camLive && camVid) {
+              const vidW = camVid.videoWidth;
+              const vidH = camVid.videoHeight;
+              if (
+                vidW !== lastKnownSensorRef.current.w ||
+                vidH !== lastKnownSensorRef.current.h
+              ) {
+                lastKnownSensorRef.current = { w: vidW, h: vidH };
+                setSensorSize({ w: vidW, h: vidH });
+              }
+            }
+
+            const hasColorAdjustments =
+              s.adjustments.brightness !== 0 ||
+              s.adjustments.contrast !== 0 ||
+              s.adjustments.saturation !== 0 ||
+              s.adjustments.temperature !== 0 ||
+              s.adjustments.softSkin !== 0 ||
+              s.adjustments.vignette !== 0;
+
+            const needsCameraBridge =
+              s.mirror ||
+              s.flipVertical ||
+              s.rotation !== 0 ||
+              s.zoom > 1.01 ||
+              s.filterId !== 'none' ||
+              s.effectId !== 'none' ||
+              s.background.mode !== 'none' ||
+              s.stabilization.enabled ||
+              s.focus.apertureBlur > 0 ||
+              s.focus.mode === 'manual' ||
+              s.focus.aiTrackingEnabled ||
+              s.focus.aiAutoFocus ||
+              hasColorAdjustments;
+
+            if (camLive && camVid && needsCameraBridge) {
+              const bridgeSrc = camVid;
+              const bSrcW = camVid.videoWidth;
+              const bSrcH = camVid.videoHeight;
+
+              const procCanvas = processedCameraCanvasRef.current!;
+              const procW = Math.min(1280, Math.max(640, bSrcW));
+              const procH = Math.round(procW * (bSrcH / Math.max(1, bSrcW)));
+              if (procCanvas.width !== procW || procCanvas.height !== procH) {
+                procCanvas.width = procW;
+                procCanvas.height = procH;
+              }
+              const procCtx = procCanvas.getContext('2d');
+              if (procCtx) {
+                // Solo procesa la capa de cámara; jamás aplica filtros a la ventana compartida
+                renderCameraFrame(
+                  procCtx,
+                  bridgeSrc,
+                  bSrcW,
+                  bSrcH,
+                  {
+                    width: procW,
+                    height: procH,
+                    mirror: s.mirror,
+                    flipVertical: s.flipVertical,
+                    rotation: s.rotation,
+                    fitMode: s.fitMode,
+                    zoom: s.zoom,
+                    panX: s.panX,
+                    panY: s.panY,
+                    filterId: s.filterId,
+                    effectId: s.effectId,
+                    adjustments: s.adjustments,
+                    focus: s.focus,
+                    stabilization: s.stabilization,
+                    background: s.background,
+                    branding: {
+                      showTimestamp: false,
+                      showLowerThird: false,
+                      lowerThirdName: '',
+                      lowerThirdTitle: '',
+                      cinemaFrame: false,
+                    },
+                    abSplitEnabled: false,
+                    abSplitPosition: 0.5,
+                  },
+                  null,
+                  () => {
+                    setBackground((prev) => ({ ...prev, hasCalibratedBg: true }));
+                    s.showToast('Fondo vacío calibrado');
+                  },
+                  null
+                );
+                processedCameraVersionRef.current += 1;
+                coordEngine.setProcessedCameraSurface({
+                  surface: procCanvas,
+                  width: procW,
+                  height: procH,
+                  alphaMode: 'straight',
+                  frameVersion: processedCameraVersionRef.current,
+                });
+              }
+            } else {
+              coordEngine.setProcessedCameraSurface(null);
+            }
+
+            // Presentación 1:1 en CameraViewport desde ProgramCanvas (sin duplicar composición)
+            const progCanvas = coordEngine.getProgramCanvas();
+            if (progCanvas && progCanvas.width > 0 && progCanvas.height > 0) {
+              if (canvas.width !== progCanvas.width || canvas.height !== progCanvas.height) {
+                canvas.width = progCanvas.width;
+                canvas.height = progCanvas.height;
+              }
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(progCanvas, 0, 0, canvas.width, canvas.height);
             }
           } else {
-            const synth = syntheticCanvasRef.current!;
-            if (synth.width !== 1920 || synth.height !== 1080) {
-              synth.width = 1920;
-              synth.height = 1080;
+            let primarySource: HTMLVideoElement | HTMLCanvasElement | null = null;
+            let srcW = 1920;
+            let srcH = 1080;
+
+            if (
+              s.cameraStatus === 'live' &&
+              videoElRef.current &&
+              videoElRef.current.readyState >= 2 &&
+              videoElRef.current.videoWidth > 0
+            ) {
+              primarySource = videoElRef.current;
+              srcW = videoElRef.current.videoWidth;
+              srcH = videoElRef.current.videoHeight;
+              if (
+                srcW !== lastKnownSensorRef.current.w ||
+                srcH !== lastKnownSensorRef.current.h
+              ) {
+                lastKnownSensorRef.current = { w: srcW, h: srcH };
+                setSensorSize({ w: srcW, h: srcH });
+              }
+            } else {
+              const synth = unavailableCameraCanvasRef.current!;
+              if (synth.width !== 1920 || synth.height !== 1080) {
+                synth.width = 1920;
+                synth.height = 1080;
+              }
+              const sCtx = synth.getContext('2d');
+              if (sCtx) {
+                renderUnavailableCameraFrame(sCtx, 1920, 1080);
+              }
+              primarySource = synth;
+              srcW = 1920;
+              srcH = 1080;
             }
-            const sCtx = synth.getContext('2d');
-            if (sCtx) {
-              renderSyntheticCameraFeed(sCtx, 1920, 1080, (now - startTime) / 1000);
+
+            const screenSource =
+              s.isScreenPipActive &&
+              screenVideoElRef.current &&
+              screenVideoElRef.current.readyState >= 2
+                ? {
+                    el: screenVideoElRef.current,
+                    w: screenVideoElRef.current.videoWidth,
+                    h: screenVideoElRef.current.videoHeight,
+                  }
+                : null;
+
+            const dualCamSource =
+              s.dualCam.enabled &&
+              secondaryVideoElRef.current &&
+              secondaryVideoElRef.current.readyState >= 2 &&
+              secondaryVideoElRef.current.videoWidth > 0
+                ? {
+                    el: secondaryVideoElRef.current,
+                    w: secondaryVideoElRef.current.videoWidth,
+                    h: secondaryVideoElRef.current.videoHeight,
+                    mirror: s.dualCam.mirror,
+                  }
+                : null;
+
+            if (primarySource) {
+              renderCameraFrame(
+                ctx,
+                primarySource,
+                srcW,
+                srcH,
+                {
+                  width: targetW,
+                  height: targetH,
+                  mirror: s.mirror,
+                  flipVertical: s.flipVertical,
+                  rotation: s.rotation,
+                  fitMode: s.fitMode,
+                  zoom: s.zoom,
+                  panX: s.panX,
+                  panY: s.panY,
+                  filterId: s.filterId,
+                  effectId: s.effectId,
+                  adjustments: s.adjustments,
+                  focus: s.focus,
+                  stabilization: s.stabilization,
+                  background: s.background,
+                  branding: s.branding,
+                  abSplitEnabled: s.abSplitEnabled,
+                  abSplitPosition: s.abSplitPosition,
+                  screenLayout: s.screenLayout,
+                  pipCorner: s.pipCorner,
+                  pipSizeRatio: s.pipSizeRatio,
+                  pipCircular: s.pipCircular,
+                },
+                screenSource,
+                () => {
+                  setBackground((prev) => ({ ...prev, hasCalibratedBg: true }));
+                  s.showToast('Fondo vacío calibrado');
+                },
+                dualCamSource
+              );
             }
-            primarySource = synth;
-            srcW = 1920;
-            srcH = 1080;
-          }
-
-          const screenSource =
-            s.isScreenPipActive &&
-            screenVideoElRef.current &&
-            screenVideoElRef.current.readyState >= 2
-              ? {
-                  el: screenVideoElRef.current,
-                  w: screenVideoElRef.current.videoWidth,
-                  h: screenVideoElRef.current.videoHeight,
-                }
-              : null;
-
-          const dualCamSource =
-            s.dualCam.enabled &&
-            secondaryVideoElRef.current &&
-            secondaryVideoElRef.current.readyState >= 2 &&
-            secondaryVideoElRef.current.videoWidth > 0
-              ? {
-                  el: secondaryVideoElRef.current,
-                  w: secondaryVideoElRef.current.videoWidth,
-                  h: secondaryVideoElRef.current.videoHeight,
-                  mirror: s.dualCam.mirror,
-                }
-              : null;
-
-          if (primarySource) {
-            renderCameraFrame(
-              ctx,
-              primarySource,
-              srcW,
-              srcH,
-              {
-                width: targetW,
-                height: targetH,
-                mirror: s.mirror,
-                flipVertical: s.flipVertical,
-                rotation: s.rotation,
-                fitMode: s.fitMode,
-                zoom: s.zoom,
-                panX: s.panX,
-                panY: s.panY,
-                filterId: s.filterId,
-                effectId: s.effectId,
-                adjustments: s.adjustments,
-                focus: s.focus,
-                stabilization: s.stabilization,
-                background: s.background,
-                branding: s.branding,
-                abSplitEnabled: s.abSplitEnabled,
-                abSplitPosition: s.abSplitPosition,
-                screenLayout: s.screenLayout,
-                pipCorner: s.pipCorner,
-                pipSizeRatio: s.pipSizeRatio,
-                pipCircular: s.pipCircular,
-              },
-              screenSource,
-              () => {
-                setBackground((prev) => ({ ...prev, hasCalibratedBg: true }));
-                s.showToast('Fondo vacío calibrado');
-              },
-              dualCamSource
-            );
           }
 
           // Live Histogram (~8fps)
           if (s.showHistogram && now - lastHistogramTime > 125) {
-            setHistogram(computeHistogram(ctx, targetW, targetH));
+            setHistogram(computeHistogram(ctx, canvas.width, canvas.height));
             lastHistogramTime = now;
           }
 
@@ -1716,11 +2109,16 @@ export default function App() {
     return () => cancelAnimationFrame(rafId);
   }, []);
 
-  // Keyboard shortcuts (Space, R, M, F, G, L, H)
+  // Keyboard shortcuts (Space, R, M, F, G, L, H, C, Escape)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+      if (e.key === 'Escape' && cinemaMode) {
+        setCinemaMode(false);
+        return;
+      }
 
       if (e.code === 'Space') {
         e.preventDefault();
@@ -1733,8 +2131,14 @@ export default function App() {
         setFrozen((v) => !v);
       } else if (e.key.toLowerCase() === 'l') {
         setRingLight((p) => ({ ...p, enabled: !p.enabled }));
+      } else if (e.key.toLowerCase() === 'c') {
+        setCinemaMode((v) => !v);
       } else if (e.key.toLowerCase() === 'h') {
-        setInspectorCollapsed((v) => !v);
+        if (cinemaMode) {
+          setCinemaMode(false);
+        } else {
+          setInspectorCollapsed((v) => !v);
+        }
       } else if (e.key.toLowerCase() === 'g') {
         const order: GridOverlayId[] = ['none', 'thirds', 'golden', 'crosshair', 'cinema'];
         setGridOverlay((curr) => order[(order.indexOf(curr) + 1) % order.length]);
@@ -1742,7 +2146,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [triggerPhotoCapture, toggleRecording]);
+  }, [triggerPhotoCapture, toggleRecording, cinemaMode]);
 
   // Native macOS Desktop Menu Actions & safe hardware release on window close
   useEffect(() => {
@@ -1761,7 +2165,7 @@ export default function App() {
           setActiveTab('gallery');
           break;
         case 'toggle-cinema-mode':
-          setInspectorCollapsed((v) => !v);
+          setCinemaMode((v) => !v);
           break;
       }
     });
@@ -1770,6 +2174,9 @@ export default function App() {
       mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
       secondaryStreamRef.current?.getTracks().forEach((t) => t.stop());
+      for (const entry of studioEngineRef.current.getActiveSourceRuntimeEntries()) {
+        entry.resources.mediaStream?.getTracks().forEach((t) => t.stop());
+      }
       audioAnalyserRef.current?.ctx.close().catch(() => {});
     };
 
@@ -1814,38 +2221,109 @@ export default function App() {
     await clearAllMediaFromDB();
   };
 
-  return (
-    <div className="h-screen w-screen flex flex-col studio-ambient-bg text-zinc-100 overflow-hidden">
-      <TopBar
-        activeTab={activeTab}
-        onSelectTab={setActiveTab}
-        galleryCount={galleryItems.length}
-        cameraStatus={cameraStatus}
-        onConnectCamera={() => startCameraStream(selectedVideoId, selectedAudioId)}
-        onQuickCapture={() => triggerPhotoCapture()}
-        inspectorCollapsed={inspectorCollapsed}
-        onToggleInspectorCollapsed={() => setInspectorCollapsed((v) => !v)}
-      />
+  const handleSelectWorkspaceTab = useCallback(
+    (tab: WorkspaceTab) => {
+      if (
+        tab !== activeTab &&
+        tab !== 'studio' &&
+        tab !== 'gallery' &&
+        appearance.leftPanel.expanded &&
+        !appearance.leftPanel.pinned
+      ) {
+        appearance.updateLeftPanel({ expanded: false });
+      }
+      setActiveTab(tab);
+    },
+    [activeTab, appearance]
+  );
 
-      {/* Camera permission / demo info strip (only shown if camera isn't live yet) */}
-      {cameraStatus !== 'live' && cameraErrorMsg && (
-        <div className="px-4 pt-1.5 shrink-0">
-          <div className="liquid-glass-dock rounded-full px-4 py-1.5 flex items-center justify-between gap-4 text-xs">
-            <span className="text-zinc-200 truncate">{cameraErrorMsg}</span>
-            <button
-              type="button"
-              onClick={() => startCameraStream(selectedVideoId, selectedAudioId)}
-              className="text-sky-300 hover:text-sky-200 font-semibold whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              Reintentar permiso de cámara
-            </button>
-          </div>
+  const studioEnginePanelProps: StudioEnginePanelProps = {
+    engineMode: studioEngine.engineMode,
+    backendKind: studioEngine.backendKind,
+    preferredBackend: studioEngine.preferredBackend,
+    isRecordingLocked: studioEngine.isRecordingLocked,
+    activeSceneId: studioEngine.activeSceneId,
+    scenes: studioEngine.scenes,
+    sources: studioEngine.sources,
+    hasLiveDisplaySource: studioEngine.hasLiveDisplaySource,
+    lastError: studioEngine.lastError,
+    diagnosticsSnapshot: studioEngine.diagnosticsSnapshot,
+    compatibilityMatrix: studioEngine.compatibilityMatrix,
+    onSwitchEngineMode: (mode) => handleSwitchEngineMode(mode),
+    onSwitchScene: (sceneId, transitionOverride) =>
+      void studioEngine.switchScene(sceneId, transitionOverride),
+    onActivatePresetScene: (presetId, transitionOverride) =>
+      void studioEngine.activatePresetScene(presetId, transitionOverride),
+    onAuthorizeDisplaySource: () => void handleAuthorizeStudioDisplaySource(),
+    onChangeBackendPreference: handleChangeStudioBackend,
+    onRecoverCanvas2dFallback: handleRecoverStudioCanvas2d,
+    onRefreshDiagnostics: () => {
+      studioEngine.refreshDiagnostics();
+    },
+    onResetProject: () => void studioEngine.resetProject(),
+  };
+
+  return (
+    <div className="h-screen w-screen flex flex-col studio-ambient-bg text-[var(--text-primary)] overflow-hidden">
+      {!cinemaMode && (
+        <TopBar
+          activeTab={activeTab}
+          onSelectTab={handleSelectWorkspaceTab}
+          galleryCount={galleryItems.length}
+          cameraStatus={cameraStatus}
+          onConnectCamera={() => {
+            if (studioEngine.engineMode === 'studio') {
+              const camSrc = studioEngine.sources.find((s) => s.kind === 'camera');
+              if (camSrc) {
+                void studioEngine.reconnectSource(camSrc.id, true);
+              }
+            } else {
+              void startCameraStream(selectedVideoId, selectedAudioId);
+            }
+          }}
+          onQuickCapture={() => triggerPhotoCapture()}
+          inspectorCollapsed={inspectorCollapsed}
+          onToggleInspectorCollapsed={() => setInspectorCollapsed((v) => !v)}
+          leftPanelExpanded={appearance.leftPanel.expanded}
+          onToggleLeftPanel={() =>
+            appearance.updateLeftPanel((prev) => ({ ...prev, expanded: !prev.expanded }))
+          }
+          cinemaMode={cinemaMode}
+          onToggleCinemaMode={() => setCinemaMode((v) => !v)}
+          isRecording={isRecording}
+          isRecordingPaused={isRecordingPaused}
+          recordingSeconds={recordingSeconds}
+          appearanceSettings={appearance.settings}
+          resolvedAppearance={appearance.resolved}
+          onUpdateAppearance={appearance.updateSettings}
+          onResetAppearance={appearance.resetAppearance}
+        />
+      )}
+
+      {/* Camera permission info strip (only shown if camera isn't live yet) */}
+      {!cinemaMode && cameraStatus !== 'live' && cameraErrorMsg && (
+        <div className="studio-chrome-bar border-b border-[var(--border-hairline)] px-4 py-1.5 flex items-center justify-between gap-4 text-xs shrink-0">
+          <span className="text-[var(--text-secondary)] truncate">{cameraErrorMsg}</span>
+          <button
+            type="button"
+            onClick={() => {
+              if (studioEngine.engineMode === 'studio') {
+                const camSrc = studioEngine.sources.find((s) => s.kind === 'camera');
+                if (camSrc) void studioEngine.reconnectSource(camSrc.id, true);
+              } else {
+                void startCameraStream(selectedVideoId, selectedAudioId);
+              }
+            }}
+            className="text-[var(--accent-blue)] hover:underline font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Reintentar permiso de cámara
+          </button>
         </div>
       )}
 
       {/* Main Workspace */}
-      <main className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
-        {activeTab === 'gallery' ? (
+      <main className="flex-1 flex flex-col min-[880px]:flex-row min-h-0 overflow-hidden relative">
+        {activeTab === 'gallery' && (
           <GalleryView
             items={galleryItems}
             onDeleteItem={handleDeleteGalleryItem}
@@ -1865,222 +2343,268 @@ export default function App() {
             }}
             onSaveEditedItem={handleSaveEditedItem}
           />
-        ) : (
-          <>
-            <CameraViewport
-              canvasRef={canvasRef}
-              aspectRatio={aspectRatio}
-              resolutionWidth={dims.w}
-              resolutionHeight={dims.h}
-              sensorSize={sensorSize}
-              cameraStatus={cameraStatus}
-              cameraLabel={cameraLabel}
-              videoDevices={videoDevices}
-              selectedVideoId={selectedVideoId}
-              onSelectVideoDevice={(id) => {
-                setSelectedVideoId(id);
-                startCameraStream(id, selectedAudioId, resolutionPreset, aspectRatio);
-              }}
-              rotation={rotation}
-              onRotate90={() => setRotation((r) => ((r + 90) % 360) as RotationDeg)}
-              mirror={mirror}
-              onToggleMirror={() => setMirror((v) => !v)}
-              frozen={frozen}
-              onToggleFreeze={() => setFrozen((v) => !v)}
-              zoom={zoom}
-              onChangeZoom={setZoom}
-              panX={panX}
-              panY={panY}
-              onChangePan={(x, y) => {
-                setPanX(x);
-                setPanY(y);
-              }}
-              focus={focus}
-              onChangeFocus={setFocus}
-              stabilization={stabilization}
-              onToggleStabilization={() =>
-                setStabilization((p) => ({ ...p, enabled: !p.enabled }))
-              }
-              filterId={filterId}
-              effectId={effectId}
-              adjustments={adjustments}
-              gridOverlay={gridOverlay}
-              ringLight={ringLight}
-              teleprompter={teleprompter}
-              onChangeTeleprompter={setTeleprompter}
-              branding={branding}
-              abSplitEnabled={abSplitEnabled}
-              abSplitPosition={abSplitPosition}
-              onChangeAbSplitPosition={setAbSplitPosition}
-              eyedropperActive={eyedropperActive}
-              onSampleColor={(col) => {
-                setSampledColor(col);
-                setEyedropperActive(false);
-                showToast(`Color muestreado: ${col.hex}`);
-              }}
-              countdownValue={countdownValue}
-              flashActive={flashActive}
-              isRecording={isRecording}
-              isRecordingPaused={isRecordingPaused}
-              recordingSeconds={recordingSeconds}
-              onCapturePhoto={() => triggerPhotoCapture()}
-              onCaptureWindow={() => void captureOtherWindowScreenshot(false)}
-              onToggleRecord={toggleRecording}
-              onTogglePauseRecord={togglePauseRecording}
-              audioLevel={micMuted ? 0 : audioLevel}
-              recentMedia={galleryItems}
-              onOpenGallery={() => setActiveTab('gallery')}
-              boothProgress={boothProgress}
-              isScreenPipActive={isScreenPipActive}
-              isDualCamActive={dualCam.enabled}
-              isOutputPipActive={isOutputPipActive}
-              onToggleOutputPip={() => void toggleOutputPip()}
-              detectedSubjects={detectedSubjects}
-              aiStatus={aiStatus}
-            />
+        )}
 
-            {!inspectorCollapsed && (
-            <SidebarControls
-              activeTab={activeTab}
-              onChangeTab={setActiveTab}
-              videoDevices={videoDevices}
-              audioDevices={audioDevices}
-              selectedVideoId={selectedVideoId}
-              selectedAudioId={selectedAudioId}
-              sensorSize={sensorSize}
-              cameraStatus={cameraStatus}
-              onRefreshDevices={() => refreshDevices()}
-              onSelectVideoDevice={(id) => {
-                setSelectedVideoId(id);
-                startCameraStream(id, selectedAudioId, resolutionPreset, aspectRatio);
-              }}
-              onSelectAudioDevice={(id) => {
-                setSelectedAudioId(id);
-                startCameraStream(selectedVideoId, id, resolutionPreset, aspectRatio);
-              }}
-              resolutionPreset={resolutionPreset}
-              onChangeResolution={(r) => {
-                setResolutionPreset(r);
-                startCameraStream(selectedVideoId, selectedAudioId, r, aspectRatio);
-              }}
-              aspectRatio={aspectRatio}
-              onChangeAspectRatio={(ar) => {
-                setAspectRatio(ar);
-                if (cameraStatus === 'live') {
-                  startCameraStream(selectedVideoId, selectedAudioId, resolutionPreset, ar);
-                }
-              }}
-              fitMode={fitMode}
-              onChangeFitMode={setFitMode}
-              rotation={rotation}
-              onRotate90={() => setRotation((r) => ((r + 90) % 360) as RotationDeg)}
-              mirror={mirror}
-              onToggleMirror={() => setMirror((v) => !v)}
-              flipVertical={flipVertical}
-              onToggleFlipVertical={() => setFlipVertical((v) => !v)}
-              zoom={zoom}
-              onChangeZoom={setZoom}
-              panX={panX}
-              panY={panY}
-              onChangePan={(x, y) => {
-                setPanX(x);
-                setPanY(y);
-              }}
-              focus={focus}
-              onChangeFocus={setFocus}
-              hardwareFocusSupported={hardwareFocusSupported}
-              stabilization={stabilization}
-              onChangeStabilization={setStabilization}
-              filterId={filterId}
-              onChangeFilter={setFilterId}
-              effectId={effectId}
-              onChangeEffect={setEffectId}
-              background={background}
-              onChangeBackground={setBackground}
-              onCalibrateBackground={() => triggerBackgroundCalibration()}
-              onClearBackgroundCalibration={() => {
-                clearBackgroundCalibration();
-                setBackground((p) => ({ ...p, hasCalibratedBg: false }));
-              }}
-              onCaptureWindowAsBackground={() => void captureOtherWindowScreenshot(true)}
-              onCaptureWindow={() => void captureOtherWindowScreenshot(false)}
-              detectedSubjects={detectedSubjects}
-              aiStatus={aiStatus}
-              adjustments={adjustments}
-              onChangeAdjustments={setAdjustments}
-              abSplitEnabled={abSplitEnabled}
-              onToggleAbSplit={() => setAbSplitEnabled((v) => !v)}
-              ringLight={ringLight}
-              onChangeRingLight={setRingLight}
-              timerSeconds={timerSeconds}
-              onChangeTimerSeconds={setTimerSeconds}
-              flashEnabled={flashEnabled}
-              onToggleFlash={() => setFlashEnabled((v) => !v)}
-              soundMuted={soundMuted}
-              onToggleSoundMuted={() => setSoundMuted((v) => !v)}
-              onStartPhotoBooth={startPhotoBooth}
-              onStartBurst={startBurst}
-              timelapseActive={timelapseActive}
-              timelapseIntervalSec={timelapseIntervalSec}
-              timelapseCount={timelapseCount}
-              onChangeTimelapseInterval={setTimelapseIntervalSec}
-              onToggleTimelapse={() => {
-                if (!timelapseActive) setTimelapseCount(0);
-                setTimelapseActive((v) => !v);
-              }}
-              motionActive={motionActive}
-              onToggleMotion={() => setMotionActive((v) => !v)}
-              motionSensitivity={motionSensitivity}
-              onChangeMotionSensitivity={setMotionSensitivity}
-              motionScore={motionScore}
-              motionEvents={motionEvents}
-              isRecording={isRecording}
-              onToggleRecord={toggleRecording}
-              recordingFormatPref={recordingFormatPref}
-              onChangeRecordingFormatPref={setRecordingFormatPref}
-              audioConsole={audioConsole}
-              onChangeAudioConsole={setAudioConsole}
-              micMuted={micMuted}
-              onToggleMicMuted={() => setMicMuted((v) => !v)}
-              audioLevel={audioLevel}
-              isScreenPipActive={isScreenPipActive}
-              onToggleScreenPip={toggleScreenPip}
-              screenLayout={screenLayout}
-              onChangeScreenLayout={setScreenLayout}
-              pipCorner={pipCorner}
-              onChangePipCorner={setPipCorner}
-              pipCircular={pipCircular}
-              onTogglePipCircular={() => setPipCircular((v) => !v)}
-              pipSizeRatio={pipSizeRatio}
-              onChangePipSizeRatio={setPipSizeRatio}
-              dualCam={dualCam}
-              onChangeDualCam={setDualCam}
-              onSwapCameras={() => void swapCameras()}
-              isOutputPipActive={isOutputPipActive}
-              onToggleOutputPip={() => void toggleOutputPip()}
-              onResetAllPreferences={resetAllPreferences}
-              teleprompter={teleprompter}
-              onChangeTeleprompter={setTeleprompter}
-              gridOverlay={gridOverlay}
-              onChangeGridOverlay={setGridOverlay}
-              branding={branding}
-              onChangeBranding={setBranding}
-              histogram={histogram}
-              showHistogram={showHistogram}
-              onToggleHistogram={() => setShowHistogram((v) => !v)}
-              eyedropperActive={eyedropperActive}
-              onToggleEyedropper={() => setEyedropperActive((v) => !v)}
-              sampledColor={sampledColor}
-              qrSupported={qrSupported}
-              qrScanning={qrScanning}
-              onToggleQrScanning={() => setQrScanning((v) => !v)}
-              lastQrResult={lastQrResult}
-              onQuickDocumentScan={() => {
-                setFilterId((curr) => (curr === 'document-scan' ? 'none' : 'document-scan'));
-              }}
-            />
-            )}
-          </>
+        {activeTab !== 'gallery' && !cinemaMode && (
+          <LeftStudioPanel
+            preferences={appearance.leftPanel}
+            onUpdatePreferences={appearance.updateLeftPanel}
+            studioEnginePanel={studioEnginePanelProps}
+            cameraStatus={cameraStatus}
+            cameraLabel={cameraLabel}
+            isScreenPipActive={isScreenPipActive}
+            isDualCamActive={dualCam.enabled}
+            onToggleScreenPip={() => void toggleScreenPip()}
+            onReconnectSource={(sourceId) => void studioEngine.reconnectSource(sourceId, true)}
+            onOpenRecordingLab={() => {
+              setActiveTab('record');
+              setStudioLabOpen(true);
+            }}
+          />
+        )}
+
+        <CameraViewport
+          hiddenForGallery={activeTab === 'gallery'}
+          cinemaMode={cinemaMode}
+          onToggleCinemaMode={() => setCinemaMode((v) => !v)}
+          canvasRef={canvasRef}
+          aspectRatio={aspectRatio}
+          resolutionWidth={dims.w}
+          resolutionHeight={dims.h}
+          sensorSize={sensorSize}
+          cameraStatus={cameraStatus}
+          cameraLabel={cameraLabel}
+          videoDevices={videoDevices}
+          selectedVideoId={selectedVideoId}
+          onSelectVideoDevice={(id) => {
+            setSelectedVideoId(id);
+            startCameraStream(id, selectedAudioId, resolutionPreset, aspectRatio);
+          }}
+          rotation={rotation}
+          onRotate90={() => setRotation((r) => ((r + 90) % 360) as RotationDeg)}
+          mirror={mirror}
+          onToggleMirror={() => setMirror((v) => !v)}
+          frozen={frozen}
+          onToggleFreeze={() => setFrozen((v) => !v)}
+          zoom={zoom}
+          onChangeZoom={setZoom}
+          panX={panX}
+          panY={panY}
+          onChangePan={(x, y) => {
+            setPanX(x);
+            setPanY(y);
+          }}
+          focus={focus}
+          onChangeFocus={setFocus}
+          stabilization={stabilization}
+          onToggleStabilization={() =>
+            setStabilization((p) => ({ ...p, enabled: !p.enabled }))
+          }
+          filterId={filterId}
+          effectId={effectId}
+          adjustments={adjustments}
+          gridOverlay={gridOverlay}
+          ringLight={ringLight}
+          teleprompter={teleprompter}
+          onChangeTeleprompter={setTeleprompter}
+          branding={branding}
+          abSplitEnabled={abSplitEnabled}
+          abSplitPosition={abSplitPosition}
+          onChangeAbSplitPosition={setAbSplitPosition}
+          eyedropperActive={eyedropperActive}
+          onSampleColor={(col) => {
+            setSampledColor(col);
+            setEyedropperActive(false);
+            showToast(`Color muestreado: ${col.hex}`);
+          }}
+          countdownValue={countdownValue}
+          flashActive={flashActive}
+          isRecording={isRecording}
+          isRecordingPaused={isRecordingPaused}
+          recordingSeconds={recordingSeconds}
+          onCapturePhoto={() => triggerPhotoCapture()}
+          onCaptureWindow={() => void captureOtherWindowScreenshot(false)}
+          onShareDisplay={() => void toggleScreenPip()}
+          displayShared={studioEngine.engineMode === 'studio' ? studioEngine.hasLiveDisplaySource : isScreenPipActive}
+          onToggleRecord={toggleRecording}
+          onTogglePauseRecord={togglePauseRecording}
+          audioLevel={micMuted ? 0 : audioLevel}
+          recentMedia={galleryItems}
+          onOpenGallery={() => setActiveTab('gallery')}
+          boothProgress={boothProgress}
+          isScreenPipActive={isScreenPipActive}
+          isDualCamActive={dualCam.enabled}
+          isOutputPipActive={isOutputPipActive}
+          onToggleOutputPip={() => void toggleOutputPip()}
+          detectedSubjects={detectedSubjects}
+          aiStatus={aiStatus}
+        />
+
+        {activeTab !== 'gallery' && !cinemaMode && !inspectorCollapsed && (
+          <SidebarControls
+            activeTab={activeTab}
+            onChangeTab={setActiveTab}
+            videoDevices={videoDevices}
+            audioDevices={audioDevices}
+            selectedVideoId={selectedVideoId}
+            selectedAudioId={selectedAudioId}
+            sensorSize={sensorSize}
+            cameraStatus={cameraStatus}
+            onRefreshDevices={() => refreshDevices()}
+            onSelectVideoDevice={(id) => {
+              setSelectedVideoId(id);
+              if (studioEngine.engineMode !== 'studio') {
+                void startCameraStream(id, selectedAudioId, resolutionPreset, aspectRatio);
+              }
+            }}
+            onSelectAudioDevice={(id) => {
+              setSelectedAudioId(id);
+              if (studioEngine.engineMode !== 'studio') {
+                void startCameraStream(selectedVideoId, id, resolutionPreset, aspectRatio);
+              }
+            }}
+            resolutionPreset={resolutionPreset}
+            onChangeResolution={(r) => {
+              if (isRecording) {
+                showToast('No se permite cambiar la resolución durante la grabación');
+                return;
+              }
+              setResolutionPreset(r);
+              if (studioEngine.engineMode === 'studio') {
+                studioEngine.setResolutionProfile(r, aspectRatio);
+              } else {
+                void startCameraStream(selectedVideoId, selectedAudioId, r, aspectRatio);
+              }
+            }}
+            aspectRatio={aspectRatio}
+            onChangeAspectRatio={(ar) => {
+              if (isRecording) {
+                showToast('No se permite cambiar la proporción durante la grabación');
+                return;
+              }
+              setAspectRatio(ar);
+              if (studioEngine.engineMode === 'studio') {
+                studioEngine.setResolutionProfile(resolutionPreset, ar);
+              } else if (cameraStatus === 'live') {
+                void startCameraStream(selectedVideoId, selectedAudioId, resolutionPreset, ar);
+              }
+            }}
+            fitMode={fitMode}
+            onChangeFitMode={setFitMode}
+            rotation={rotation}
+            onRotate90={() => setRotation((r) => ((r + 90) % 360) as RotationDeg)}
+            mirror={mirror}
+            onToggleMirror={() => setMirror((v) => !v)}
+            flipVertical={flipVertical}
+            onToggleFlipVertical={() => setFlipVertical((v) => !v)}
+            zoom={zoom}
+            onChangeZoom={setZoom}
+            panX={panX}
+            panY={panY}
+            onChangePan={(x, y) => {
+              setPanX(x);
+              setPanY(y);
+            }}
+            focus={focus}
+            onChangeFocus={setFocus}
+            hardwareFocusSupported={hardwareFocusSupported}
+            stabilization={stabilization}
+            onChangeStabilization={setStabilization}
+            filterId={filterId}
+            onChangeFilter={setFilterId}
+            effectId={effectId}
+            onChangeEffect={setEffectId}
+            background={background}
+            onChangeBackground={setBackground}
+            onCalibrateBackground={() => triggerBackgroundCalibration()}
+            onClearBackgroundCalibration={() => {
+              clearBackgroundCalibration();
+              setBackground((p) => ({ ...p, hasCalibratedBg: false }));
+            }}
+            onCaptureWindowAsBackground={() => void captureOtherWindowScreenshot(true)}
+            onCaptureWindow={() => void captureOtherWindowScreenshot(false)}
+            detectedSubjects={detectedSubjects}
+            aiStatus={aiStatus}
+            adjustments={adjustments}
+            onChangeAdjustments={setAdjustments}
+            abSplitEnabled={abSplitEnabled}
+            onToggleAbSplit={() => setAbSplitEnabled((v) => !v)}
+            ringLight={ringLight}
+            onChangeRingLight={setRingLight}
+            timerSeconds={timerSeconds}
+            onChangeTimerSeconds={setTimerSeconds}
+            flashEnabled={flashEnabled}
+            onToggleFlash={() => setFlashEnabled((v) => !v)}
+            soundMuted={soundMuted}
+            onToggleSoundMuted={() => setSoundMuted((v) => !v)}
+            onStartPhotoBooth={startPhotoBooth}
+            onStartBurst={startBurst}
+            timelapseActive={timelapseActive}
+            timelapseIntervalSec={timelapseIntervalSec}
+            timelapseCount={timelapseCount}
+            onChangeTimelapseInterval={setTimelapseIntervalSec}
+            onToggleTimelapse={() => {
+              if (!timelapseActive) setTimelapseCount(0);
+              setTimelapseActive((v) => !v);
+            }}
+            motionActive={motionActive}
+            onToggleMotion={() => setMotionActive((v) => !v)}
+            motionSensitivity={motionSensitivity}
+            onChangeMotionSensitivity={setMotionSensitivity}
+            motionScore={motionScore}
+            motionEvents={motionEvents}
+            isRecording={isRecording}
+            onToggleRecord={toggleRecording}
+            recordingFormatPref={recordingFormatPref}
+            onChangeRecordingFormatPref={setRecordingFormatPref}
+            audioConsole={audioConsole}
+            onChangeAudioConsole={setAudioConsole}
+            micMuted={micMuted}
+            onToggleMicMuted={() => setMicMuted((v) => !v)}
+            audioLevel={audioLevel}
+            isScreenPipActive={isScreenPipActive}
+            onToggleScreenPip={toggleScreenPip}
+            screenLayout={screenLayout}
+            onChangeScreenLayout={setScreenLayout}
+            pipCorner={pipCorner}
+            onChangePipCorner={setPipCorner}
+            pipCircular={pipCircular}
+            onTogglePipCircular={() => setPipCircular((v) => !v)}
+            pipSizeRatio={pipSizeRatio}
+            onChangePipSizeRatio={setPipSizeRatio}
+            dualCam={dualCam}
+            onChangeDualCam={setDualCam}
+            onSwapCameras={() => void swapCameras()}
+            isOutputPipActive={isOutputPipActive}
+            onToggleOutputPip={() => void toggleOutputPip()}
+            onResetAllPreferences={resetAllPreferences}
+            teleprompter={teleprompter}
+            onChangeTeleprompter={setTeleprompter}
+            gridOverlay={gridOverlay}
+            onChangeGridOverlay={setGridOverlay}
+            branding={branding}
+            onChangeBranding={setBranding}
+            histogram={histogram}
+            showHistogram={showHistogram}
+            onToggleHistogram={() => setShowHistogram((v) => !v)}
+            eyedropperActive={eyedropperActive}
+            onToggleEyedropper={() => setEyedropperActive((v) => !v)}
+            sampledColor={sampledColor}
+            qrSupported={qrSupported}
+            qrScanning={qrScanning}
+            onToggleQrScanning={() => setQrScanning((v) => !v)}
+            lastQrResult={lastQrResult}
+            onQuickDocumentScan={() => {
+              setFilterId((curr) => (curr === 'document-scan' ? 'none' : 'document-scan'));
+            }}
+            studioEnginePanel={studioEnginePanelProps}
+            appearanceSettings={appearance.settings}
+            resolvedAppearance={appearance.resolved}
+            onUpdateAppearance={appearance.updateSettings}
+            onResetAppearance={appearance.resetAppearance}
+            studioLabOpen={studioLabOpen}
+            onToggleStudioLabOpen={setStudioLabOpen}
+          />
         )}
       </main>
 
@@ -2095,7 +2619,7 @@ export default function App() {
 
       {/* Subtle Liquid Glass Toast Confirmation */}
       {toastMsg && (
-        <div className="liquid-glass-dock fixed bottom-20 left-1/2 -translate-x-1/2 z-50 text-white px-4 py-2 rounded-full text-xs font-medium flex items-center gap-3">
+        <div className="glass-dense fixed bottom-16 left-1/2 -translate-x-1/2 z-50 text-[var(--text-primary)] px-4 py-2 rounded-full text-xs font-medium flex items-center gap-3">
           <span>{toastMsg}</span>
           <button
             type="button"
@@ -2103,7 +2627,7 @@ export default function App() {
               setToastMsg(null);
               setActiveTab('gallery');
             }}
-            className="text-sky-300 hover:text-sky-200 font-semibold cursor-pointer"
+            className="text-[var(--accent-blue)] hover:underline font-semibold cursor-pointer"
           >
             Ver galería
           </button>

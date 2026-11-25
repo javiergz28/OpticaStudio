@@ -18,6 +18,7 @@
     "desktop:build": "npm run icons:build && npm run build && node scripts/build-electron.mjs",
     "desktop:package": "npm run desktop:build && npx electron-builder --mac --arm64 --dir",
     "desktop:dist": "npm run desktop:build && npx electron-builder --mac --arm64",
+    "test": "tsx --test tests/*.test.ts",
     "desktop:dist:local": "npm run desktop:build && electron-builder --mac --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false"
   },
   "dependencies": {
