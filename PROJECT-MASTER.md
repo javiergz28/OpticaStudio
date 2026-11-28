@@ -779,3 +779,10 @@ Auditoría realizada directamente sobre los 9 módulos del motor audiovisual ant
 - AI Studio conserva el vínculo original a main y 31 archivos pendientes de push. No se ejecutó push desde AI Studio.
 - La interfaz de GitHub sync no ofrece selector de rama. El diálogo Disconnect advierte que después solo permite sincronizar con un repositorio nuevo; se canceló. El importador Build muestra únicamente main y advierte que el código importado no se mantiene sincronizado. No se desconectó, importó ni creó otra app/repo.
 - Hasta resolver esta limitación, dev es la base compartida de GitHub, pero no existe sincronización bidireccional verificada con AI Studio. No declarar sincronización completa ni iniciar CP-P03-A desde AI Studio sobre una base desactualizada. No modificar main ni usar force-push.
+
+### Verificación de retorno AI Studio a GitHub (2026-11-28)
+
+- **Estado de aprobación:** `CP-P02-R3` (`CP-P02-C3-R3`) está aprobado físicamente por el usuario.
+- **Estado de sincronización:** Se está comprobando el retorno de cambios desde Google AI Studio hacia la rama `dev` en GitHub.
+- **Próxima fase:** `CP-P03-A` todavía no se inició.
+
