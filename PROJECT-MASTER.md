@@ -793,3 +793,13 @@ Auditoría realizada directamente sobre los 9 módulos del motor audiovisual ant
 - AI Studio generó el commit 0a21ba1 en dev con la prueba documental; la Mac lo recuperó con fast-forward. main sigue en 28f38e6 y está protegida contra escrituras durante esta configuración.
 - AI Studio regeneró el lockfile, los iconos y el modo ejecutable del lanzador. Restaurados desde la base aprobada. No aceptar automáticamente esas diferencias en futuras sincronizaciones; revisar cada diff antes de instalar.
 - CP-P02 cerrado. Próximo CP-P03-A: aislamiento de estado por fuente/capa, respetando el alcance del plan maestro y las 119 pruebas existentes. No se ha iniciado su implementación.
+
+### Política permanente de organización y conservación (2026-11-28)
+
+Aprobada expresamente por el usuario y aplicada al proyecto. Las reglas operativas están en AGENTS.md y son obligatorias para ambos asistentes.
+- Un único DEV activo: OpticaStudio-DEV-SHARED, rama dev; main permanece estable. Historial mediante Git.
+- Un único respaldo anterior del perfil en Application Support/OpticaStudio-Backups/Perfil-anterior; ninguna copia suelta en Documentos. Perfil activo y galería intactos. Una sola app instalada.
+- Limpiar temporales al cerrar cada checkpoint; no duplicar dependencias, compilaciones ni directorios de desarrollo. Preservar código no consolidado y evidencia relevante, no borrar datos personales ni vaciar Papelera.
+- Limpieza ejecutada: 6 directorios DEV históricos retirados; 5.326.072 KiB de dependencias y compilaciones regenerables eliminados de esas copias, fuentes históricas conservadas reversiblemente en Papelera. 7 ZIP/parches obsoletos y logs redundantes trasladados a Papelera. Tamaño contabilizado, no equivale necesariamente a espacio físico liberado en APFS.
+- R3 instalada intacta (SHA-256 ca9d2808f8d3fd48096f025d77c88cb9b7187ac202501429d279739eeb3ece0e).
+- CP-P03-A: Google AI Studio interrumpido por cuota después de editar subjectMatte.ts, webglEffects.ts, aiVision.ts y canvasProcessor.ts. Cambios parciales aún en AI Studio; no instalados ni verificados. Antes de continuar recuperar y auditar ese trabajo, sin perderlo por pull o sobrescritura.
