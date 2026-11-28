@@ -772,3 +772,10 @@ Auditoría realizada directamente sobre los 9 módulos del motor audiovisual ant
 - Un solo editor activo por checkpoint. Antes de editar, verificar HEAD remoto y traer cambios. Al terminar, ejecutar pruebas, actualizar PROJECT-MASTER.md, commit y sincronizar únicamente dev. Nunca force-push; ante divergencia comparar y reconciliar antes de continuar.
 - Proteger lockfile ARM64, Electron, workflows, recursos locales, iconos y decisiones aprobadas. No versionar perfiles, medios privados, credenciales, archivos de sincronización ni compilaciones.
 - CP-P03-A comienza solamente tras comprobar sincronización bidireccional con la base aprobada.
+
+### Estado de sincronización GitHub (2026-11-28)
+
+- Usuario autorizó publicar la rama dev en el repositorio público OpticaStudio. Base CP-P02-C3-R3 publicada en 6c12f97, main intacta en 28f38e6.
+- AI Studio conserva el vínculo original a main y 31 archivos pendientes de push. No se ejecutó push desde AI Studio.
+- La interfaz de GitHub sync no ofrece selector de rama. El diálogo Disconnect advierte que después solo permite sincronizar con un repositorio nuevo; se canceló. El importador Build muestra únicamente main y advierte que el código importado no se mantiene sincronizado. No se desconectó, importó ni creó otra app/repo.
+- Hasta resolver esta limitación, dev es la base compartida de GitHub, pero no existe sincronización bidireccional verificada con AI Studio. No declarar sincronización completa ni iniciar CP-P03-A desde AI Studio sobre una base desactualizada. No modificar main ni usar force-push.
