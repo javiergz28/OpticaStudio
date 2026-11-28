@@ -786,3 +786,10 @@ Auditoría realizada directamente sobre los 9 módulos del motor audiovisual ant
 - **Estado de sincronización:** Se está comprobando el retorno de cambios desde Google AI Studio hacia la rama `dev` en GitHub.
 - **Próxima fase:** `CP-P03-A` todavía no se inició.
 
+
+### Sincronización bidireccional verificada (2026-11-28)
+
+- GitHub tiene dev como rama predeterminada. La aplicación original de Google AI Studio recibió R3 desde dev y resolvió 10 conflictos conservando la base aprobada. La etiqueta main de su interfaz no representa el destino real verificado.
+- AI Studio generó el commit 0a21ba1 en dev con la prueba documental; la Mac lo recuperó con fast-forward. main sigue en 28f38e6 y está protegida contra escrituras durante esta configuración.
+- AI Studio regeneró el lockfile, los iconos y el modo ejecutable del lanzador. Restaurados desde la base aprobada. No aceptar automáticamente esas diferencias en futuras sincronizaciones; revisar cada diff antes de instalar.
+- CP-P02 cerrado. Próximo CP-P03-A: aislamiento de estado por fuente/capa, respetando el alcance del plan maestro y las 119 pruebas existentes. No se ha iniciado su implementación.
