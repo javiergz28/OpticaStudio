@@ -12,21 +12,30 @@ import type {
   ProcessedLayerSurface,
   ProgramSurfaceLike,
 } from '../engine/programCompositor';
-import type { SourceRuntimeEntry } from '../engine/sourceManager';
+import type { MediaDeviceDescriptor, SourceRuntimeEntry } from '../engine/sourceManager';
 import {
   createStarterStudioProject,
   StudioCoordinator,
+  type AddRealSourceRequest,
+  type AddRealSourceResult,
+  type CompositionHistoryStatus,
   type LegacyStreamHandoff,
   type ModeSwitchResult,
   type PreferredCompositorBackend,
+  type RemoveSourceResult,
   type StudioDiagnosticsSnapshot,
 } from '../engine/studioCoordinator';
+import type { AdaptableSceneLayoutId } from '../engine/layerEditor';
 import type { AspectRatioId, ResolutionPresetId } from '../types/camera';
 import type {
+  LayerStyle,
+  LayerTransform,
+  SceneLayer,
   SceneTransition,
   StudioPresetId,
   StudioProject,
   StudioScene,
+  StudioSource,
 } from '../types/studio';
 
 export interface UseStudioEngineOptions {
@@ -45,11 +54,15 @@ export interface StudioEngineUiSnapshot {
   isRecordingLocked: boolean;
   activeSceneId: string;
   scenes: StudioScene[];
+  projectSources: StudioSource[];
   sources: StudioDiagnosticsSnapshot['sources'];
+  outputWidth: number;
+  outputHeight: number;
   activeTransitionType: 'cut' | 'fade' | null;
   lastError: string | null;
   hasLiveDisplaySource: boolean;
   hasLiveCameraSource: boolean;
+  historyStatus: CompositionHistoryStatus;
 }
 
 export interface UseStudioEngineResult {
@@ -59,10 +72,14 @@ export interface UseStudioEngineResult {
   isRecordingLocked: boolean;
   activeSceneId: string;
   scenes: StudioScene[];
+  projectSources: StudioSource[];
   sources: StudioDiagnosticsSnapshot['sources'];
+  outputWidth: number;
+  outputHeight: number;
   hasLiveDisplaySource: boolean;
   hasLiveCameraSource: boolean;
   lastError: string | null;
+  historyStatus: CompositionHistoryStatus;
   diagnosticsSnapshot: StudioDiagnosticsSnapshot | null;
   compatibilityMatrix: readonly EngineCompatibilityItem[];
 
@@ -73,6 +90,7 @@ export interface UseStudioEngineResult {
   getActiveAudioMediaTracks: () => MediaStreamTrack[];
   getDiagnosticsSnapshot: () => StudioDiagnosticsSnapshot;
   refreshDiagnostics: () => StudioDiagnosticsSnapshot;
+  enumerateAvailableDevices: () => Promise<MediaDeviceDescriptor[]>;
 
   registerFrameRenderedListener: (
     listener: ((stats: CompositorFrameStats, surface: ProgramSurfaceLike) => void) | null
@@ -99,12 +117,97 @@ export interface UseStudioEngineResult {
   recoverLostContextWithCanvas2d: () => { ok: boolean; reason?: string };
   setRecordingLocked: (locked: boolean) => void;
   setProcessedCameraSurface: (frame: ProcessedLayerSurface | null) => void;
+  updateSceneLayerTransform: (
+    sceneId: string,
+    layerId: string,
+    transformPatch: Partial<LayerTransform>,
+    options?: { preserveAspectK?: number; historyGroupKey?: string; historyLabel?: string }
+  ) => { ok: boolean; reason?: string; layer?: SceneLayer; constraintApplied?: boolean };
+  updateSceneLayerStyle: (
+    sceneId: string,
+    layerId: string,
+    stylePatch: Partial<LayerStyle>,
+    options?: { historyGroupKey?: string; historyLabel?: string }
+  ) => { ok: boolean; reason?: string; layer?: SceneLayer };
+  applyAdaptableLayout: (
+    sceneId: string,
+    layoutId: AdaptableSceneLayoutId,
+    options?: {
+      sensorWidth?: number;
+      sensorHeight?: number;
+      selectedLayerId?: string;
+      participatingLayerIds?: string[];
+      primaryDisplayLayerId?: string;
+      secondaryDisplayLayerId?: string;
+      primaryCameraLayerId?: string;
+      intrinsicWidth?: number;
+      intrinsicHeight?: number;
+    }
+  ) => { ok: boolean; reason?: string; scene?: StudioScene };
+  setSceneLayerLocked: (sceneId: string, layerId: string, locked: boolean) => boolean;
+  reorderSceneLayers: (
+    sceneId: string,
+    orderedLayerIds: string[]
+  ) => { ok: boolean; scene?: StudioScene; reason?: string };
+  moveSceneLayerOrder: (
+    sceneId: string,
+    layerId: string,
+    direction: 'up' | 'down' | 'top' | 'bottom'
+  ) => { ok: boolean; scene?: StudioScene; reason?: string };
+  placeSceneLayerBehindCamera: (
+    sceneId: string,
+    layerId: string
+  ) => { ok: boolean; scene?: StudioScene; reason?: string };
+  setSceneLayerVisible: (
+    sceneId: string,
+    layerId: string,
+    visible: boolean
+  ) => Promise<{ ok: boolean; layer?: SceneLayer; reason?: string }>;
+  renameSceneLayer: (
+    sceneId: string,
+    layerId: string,
+    newName: string
+  ) => { ok: boolean; layer?: SceneLayer; reason?: string };
+  duplicateSceneLayer: (
+    sceneId: string,
+    layerId: string
+  ) => { ok: boolean; layer?: SceneLayer | null; reason?: string };
+  resetSceneLayerTransform: (
+    sceneId: string,
+    layerId: string
+  ) => { ok: boolean; layer?: SceneLayer; reason?: string };
+  resetSceneLayerStyle: (
+    sceneId: string,
+    layerId: string
+  ) => { ok: boolean; layer?: SceneLayer; reason?: string };
+  removeSceneLayer: (sceneId: string, layerId: string) => { ok: boolean; reason?: string };
+  addRealSourceToScene: (
+    sceneId: string,
+    request: AddRealSourceRequest
+  ) => Promise<AddRealSourceResult>;
+  addExistingSourceToScene: (
+    sceneId: string,
+    sourceId: string,
+    options?: { placement?: 'behind-camera' | 'top'; name?: string }
+  ) => Promise<AddRealSourceResult>;
+  renameProjectSource: (
+    sourceId: string,
+    newName: string
+  ) => { ok: boolean; source?: StudioSource; reason?: string };
+  removeProjectSourceSafely: (sourceId: string) => Promise<RemoveSourceResult>;
+  beginCompositionGesture: (label: string) => void;
+  commitCompositionGesture: (label?: string) => boolean;
+  cancelCompositionGesture: () => void;
+  undoComposition: () => Promise<{ ok: boolean; label?: string; reason?: string }>;
+  redoComposition: () => Promise<{ ok: boolean; label?: string; reason?: string }>;
+  flushPersistence: () => Promise<void>;
   resetProject: () => Promise<void>;
 }
 
 function buildUiSnapshot(coord: StudioCoordinator): StudioEngineUiSnapshot {
   const diag = coord.getDiagnosticsSnapshot();
   const project = coord.getProject();
+  const dims = coord.getOutputDimensions();
   return {
     engineMode: diag.engineMode,
     backendKind: diag.backendKind,
@@ -112,7 +215,10 @@ function buildUiSnapshot(coord: StudioCoordinator): StudioEngineUiSnapshot {
     isRecordingLocked: diag.recordingLocked,
     activeSceneId: diag.activeSceneId ?? project.activeSceneId,
     scenes: project.scenes,
+    projectSources: project.sources,
     sources: diag.sources,
+    outputWidth: dims.width,
+    outputHeight: dims.height,
     activeTransitionType: diag.activeTransition?.type ?? null,
     lastError: diag.lastError,
     hasLiveDisplaySource: diag.sources.some(
@@ -121,6 +227,7 @@ function buildUiSnapshot(coord: StudioCoordinator): StudioEngineUiSnapshot {
     hasLiveCameraSource: diag.sources.some(
       (s) => s.kind === 'camera' && s.status === 'live'
     ),
+    historyStatus: coord.getHistoryStatus(),
   };
 }
 
@@ -157,11 +264,22 @@ export function useStudioEngine(options: UseStudioEngineOptions): UseStudioEngin
       isRecordingLocked: false,
       activeSceneId: fallbackProject.activeSceneId,
       scenes: fallbackProject.scenes,
+      projectSources: fallbackProject.sources,
       sources: [],
+      outputWidth: 1920,
+      outputHeight: 1080,
       activeTransitionType: null,
       lastError: null,
       hasLiveDisplaySource: false,
       hasLiveCameraSource: false,
+      historyStatus: {
+        canUndo: false,
+        canRedo: false,
+        undoLabel: null,
+        redoLabel: null,
+        undoCount: 0,
+        redoCount: 0,
+      },
     };
   }
 
@@ -383,6 +501,234 @@ export function useStudioEngine(options: UseStudioEngineOptions): UseStudioEngin
     coord.setProcessedCameraSurface(frame);
   }, []);
 
+  const updateSceneLayerTransform = useCallback(
+    (
+      sceneId: string,
+      layerId: string,
+      transformPatch: Partial<LayerTransform>,
+      opts?: { preserveAspectK?: number; historyGroupKey?: string; historyLabel?: string }
+    ) => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) {
+        return { ok: false, reason: 'Coordinador no disponible.' };
+      }
+      return coord.updateSceneLayerTransform(sceneId, layerId, transformPatch, opts);
+    },
+    []
+  );
+
+  const updateSceneLayerStyle = useCallback(
+    (
+      sceneId: string,
+      layerId: string,
+      stylePatch: Partial<LayerStyle>,
+      opts?: { historyGroupKey?: string; historyLabel?: string }
+    ) => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) {
+        return { ok: false, reason: 'Coordinador no disponible.' };
+      }
+      return coord.updateSceneLayerStyle(sceneId, layerId, stylePatch, opts);
+    },
+    []
+  );
+
+  const applyAdaptableLayout = useCallback(
+    (
+      sceneId: string,
+      layoutId: AdaptableSceneLayoutId,
+      opts?: {
+        sensorWidth?: number;
+        sensorHeight?: number;
+        selectedLayerId?: string;
+        participatingLayerIds?: string[];
+        intrinsicWidth?: number;
+        intrinsicHeight?: number;
+      }
+    ) => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) {
+        return { ok: false, reason: 'Coordinador no disponible.' };
+      }
+      return coord.applyAdaptableLayout(sceneId, layoutId, opts);
+    },
+    []
+  );
+
+  const setSceneLayerLocked = useCallback(
+    (sceneId: string, layerId: string, locked: boolean) => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) return false;
+      return coord.setSceneLayerLocked(sceneId, layerId, locked);
+    },
+    []
+  );
+
+  const reorderSceneLayers = useCallback(
+    (sceneId: string, orderedLayerIds: string[]) => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) {
+        return { ok: false, reason: 'Coordinador no disponible.' };
+      }
+      return coord.reorderSceneLayers(sceneId, orderedLayerIds);
+    },
+    []
+  );
+
+  const moveSceneLayerOrder = useCallback(
+    (sceneId: string, layerId: string, direction: 'up' | 'down' | 'top' | 'bottom') => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) {
+        return { ok: false, reason: 'Coordinador no disponible.' };
+      }
+      return coord.moveSceneLayerOrder(sceneId, layerId, direction);
+    },
+    []
+  );
+
+  const setSceneLayerVisible = useCallback(
+    async (sceneId: string, layerId: string, visible: boolean) => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) {
+        return { ok: false, reason: 'Coordinador no disponible.' };
+      }
+      return coord.setSceneLayerVisible(sceneId, layerId, visible);
+    },
+    []
+  );
+
+  const renameSceneLayer = useCallback(
+    (sceneId: string, layerId: string, newName: string) => {
+      const coord = coordinatorRef.current;
+      if (!coord || coord.isDisposed()) {
+        return { ok: false, reason: 'Coordinador no disponible.' };
+      }
+      return coord.renameSceneLayer(sceneId, layerId, newName);
+    },
+    []
+  );
+
+  const duplicateSceneLayer = useCallback((sceneId: string, layerId: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, layer: null, reason: 'Coordinador no disponible.' };
+    }
+    return coord.duplicateSceneLayer(sceneId, layerId);
+  }, []);
+
+  const resetSceneLayerTransform = useCallback((sceneId: string, layerId: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, reason: 'Coordinador no disponible.' };
+    }
+    return coord.resetSceneLayerTransform(sceneId, layerId);
+  }, []);
+
+  const resetSceneLayerStyle = useCallback((sceneId: string, layerId: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, reason: 'Coordinador no disponible.' };
+    }
+    return coord.resetSceneLayerStyle(sceneId, layerId);
+  }, []);
+
+  const removeSceneLayer = useCallback((sceneId: string, layerId: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, reason: 'Coordinador no disponible.' };
+    }
+    return coord.removeSceneLayer(sceneId, layerId);
+  }, []);
+
+  const placeSceneLayerBehindCamera = useCallback((sceneId: string, layerId: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, reason: 'Coordinador no disponible.' };
+    }
+    return coord.placeSceneLayerBehindCamera(sceneId, layerId);
+  }, []);
+
+  const addRealSourceToScene = useCallback(
+    async (sceneId: string, request: AddRealSourceRequest): Promise<AddRealSourceResult> => {
+      const coord = ensureCoordinator();
+      return coord.addRealSourceToScene(sceneId, request);
+    },
+    [ensureCoordinator]
+  );
+
+  const addExistingSourceToScene = useCallback(
+    async (
+      sceneId: string,
+      sourceId: string,
+      options?: { placement?: 'behind-camera' | 'top'; name?: string }
+    ): Promise<AddRealSourceResult> => {
+      const coord = ensureCoordinator();
+      return coord.addExistingSourceToScene(sceneId, sourceId, options);
+    },
+    [ensureCoordinator]
+  );
+
+  const renameProjectSource = useCallback((sourceId: string, newName: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, reason: 'Coordinador no disponible.' };
+    }
+    return coord.renameProjectSource(sourceId, newName);
+  }, []);
+
+  const removeProjectSourceSafely = useCallback(
+    async (sourceId: string): Promise<RemoveSourceResult> => {
+      const coord = ensureCoordinator();
+      return coord.removeProjectSourceSafely(sourceId);
+    },
+    [ensureCoordinator]
+  );
+
+  const enumerateAvailableDevices = useCallback(async () => {
+    const coord = ensureCoordinator();
+    return coord.enumerateAvailableDevices();
+  }, [ensureCoordinator]);
+
+  const beginCompositionGesture = useCallback((label: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) return;
+    coord.beginCompositionGesture(label);
+  }, []);
+
+  const commitCompositionGesture = useCallback((label?: string) => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) return false;
+    return coord.commitCompositionGesture(label);
+  }, []);
+
+  const cancelCompositionGesture = useCallback(() => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) return;
+    coord.cancelCompositionGesture();
+  }, []);
+
+  const undoComposition = useCallback(async () => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, reason: 'Coordinador no disponible.' };
+    }
+    return coord.undoComposition();
+  }, []);
+
+  const redoComposition = useCallback(async () => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) {
+      return { ok: false, reason: 'Coordinador no disponible.' };
+    }
+    return coord.redoComposition();
+  }, []);
+
+  const flushPersistence = useCallback(async () => {
+    const coord = coordinatorRef.current;
+    if (!coord || coord.isDisposed()) return;
+    await coord.flushPersistence();
+  }, []);
+
   const resetProject = useCallback(async () => {
     const coord = ensureCoordinator();
     await coord.resetProjectToStarter();
@@ -396,10 +742,14 @@ export function useStudioEngine(options: UseStudioEngineOptions): UseStudioEngin
     isRecordingLocked: uiState.isRecordingLocked,
     activeSceneId: uiState.activeSceneId,
     scenes: uiState.scenes,
+    projectSources: uiState.projectSources,
     sources: uiState.sources,
+    outputWidth: uiState.outputWidth,
+    outputHeight: uiState.outputHeight,
     hasLiveDisplaySource: uiState.hasLiveDisplaySource,
     hasLiveCameraSource: uiState.hasLiveCameraSource,
     lastError: uiState.lastError,
+    historyStatus: uiState.historyStatus,
     diagnosticsSnapshot,
     compatibilityMatrix: STUDIO_ENGINE_COMPATIBILITY_MATRIX,
 
@@ -410,6 +760,7 @@ export function useStudioEngine(options: UseStudioEngineOptions): UseStudioEngin
     getActiveAudioMediaTracks,
     getDiagnosticsSnapshot,
     refreshDiagnostics,
+    enumerateAvailableDevices,
 
     registerFrameRenderedListener,
 
@@ -424,6 +775,29 @@ export function useStudioEngine(options: UseStudioEngineOptions): UseStudioEngin
     recoverLostContextWithCanvas2d,
     setRecordingLocked,
     setProcessedCameraSurface,
+    updateSceneLayerTransform,
+    updateSceneLayerStyle,
+    applyAdaptableLayout,
+    setSceneLayerLocked,
+    reorderSceneLayers,
+    moveSceneLayerOrder,
+    placeSceneLayerBehindCamera,
+    setSceneLayerVisible,
+    renameSceneLayer,
+    duplicateSceneLayer,
+    resetSceneLayerTransform,
+    resetSceneLayerStyle,
+    removeSceneLayer,
+    addRealSourceToScene,
+    addExistingSourceToScene,
+    renameProjectSource,
+    removeProjectSourceSafely,
+    beginCompositionGesture,
+    commitCompositionGesture,
+    cancelCompositionGesture,
+    undoComposition,
+    redoComposition,
+    flushPersistence,
     resetProject,
   };
 }

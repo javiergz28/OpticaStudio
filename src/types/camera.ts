@@ -103,7 +103,7 @@ export interface StabilizationSettings {
   strength: number; // 20 to 100
 }
 
-export type BackgroundReplaceMode = 'none' | 'blur' | 'color' | 'image';
+export type BackgroundReplaceMode = 'none' | 'blur' | 'color' | 'image' | 'transparent';
 
 export interface BackgroundSegmentationSettings {
   mode: BackgroundReplaceMode;

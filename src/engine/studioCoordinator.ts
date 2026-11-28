@@ -19,25 +19,62 @@ import {
 import {
   addLayerToScene,
   addSource,
+  clampLayerStyle,
+  clampLayerTransform,
   createScene,
+  duplicateLayerInScene,
+  moveLayerOrder,
+  removeLayerFromScene,
+  removeSourceSafely,
+  renameLayerInScene,
+  reorderSceneLayers,
+  resetLayerStyleInScene,
+  resetLayerTransformInScene,
   setActiveScene,
+  setLayerLocked,
+  setLayerVisibility,
+  updateLayerStyle,
+  updateLayerTransform,
+  updateMultipleLayerTransforms,
+  updateSource,
+  validateProjectReferences,
 } from './sceneEngine';
+import {
+  clampVisualLayerTransformForScene,
+  computeAdaptableSceneLayout,
+  isVisualSourceEditable,
+  type AdaptableSceneLayoutId,
+} from './layerEditor';
+import {
+  CompositionHistory,
+  type CompositionHistoryStatus,
+} from './compositionHistory';
 import { instantiatePresetProject } from './scenePresets';
 import {
   SourceManager,
+  type MediaDeviceDescriptor,
   type MediaStreamLike,
   type MediaStreamTrackLike,
+  type PlatformMediaCapabilities,
   type SourceManagerOptions,
   type SourceRuntimeEntry,
 } from './sourceManager';
 import type { AspectRatioId, ResolutionPresetId } from '../types/camera';
 import type {
+  LayerStyle,
+  LayerTransform,
+  SceneLayer,
   SceneTransition,
   StudioPresetId,
   StudioProject,
   StudioScene,
   StudioSource,
 } from '../types/studio';
+import {
+  deleteStudioAssetBlob,
+  isStudioAssetRef,
+  saveStudioAssetBlob,
+} from '../utils/studioAssetStore';
 import {
   createBrowserStudioStorageAdapter,
   createControlledProjectSaver,
@@ -103,6 +140,111 @@ export interface ModeSwitchResult {
   handedBackMicStream?: MediaStream | null;
   handedBackCameraTracks?: MediaStreamTrackLike[];
   handedBackMicTracks?: MediaStreamTrackLike[];
+}
+
+export type { CompositionHistoryStatus };
+
+export type AddRealSourceRequest =
+  | {
+      kind: 'camera';
+      name?: string;
+      deviceId?: string;
+      deviceLabelHint?: string;
+      preferredWidth?: number;
+      preferredHeight?: number;
+      preferredFps?: 30 | 60;
+    }
+  | {
+      kind: 'window';
+      name?: string;
+      sourceTitleHint?: string;
+      placement?: 'behind-camera';
+      includeSystemAudio?: boolean;
+    }
+  | {
+      kind: 'screen';
+      name?: string;
+      displayNameHint?: string;
+      placement?: 'behind-camera';
+      includeSystemAudio?: boolean;
+    }
+  | {
+      kind: 'image';
+      name?: string;
+      file?: Blob;
+      assetRef?: string;
+      intrinsicWidth?: number;
+      intrinsicHeight?: number;
+    }
+  | {
+      kind: 'video-file';
+      name?: string;
+      file?: Blob;
+      assetRef?: string;
+      loop?: boolean;
+      playbackRate?: number;
+      mutedByDefault?: boolean;
+    }
+  | {
+      kind: 'text';
+      name?: string;
+      text: string;
+      subtitle?: string;
+      fontFamily?: 'sans' | 'mono';
+      fontSizePx?: number;
+      textColor?: string;
+      accentColor?: string;
+      glassBackdrop?: boolean;
+      align?: 'left' | 'center' | 'right';
+    }
+  | {
+      kind: 'color';
+      name?: string;
+      color: string;
+    }
+  | {
+      kind: 'gradient';
+      name?: string;
+      startColor: string;
+      endColor: string;
+      angleDeg?: number;
+    }
+  | {
+      kind: 'microphone';
+      name?: string;
+      deviceId?: string;
+      deviceLabelHint?: string;
+      echoCancellation?: boolean;
+      noiseSuppression?: boolean;
+    }
+  | {
+      kind: 'audio-file';
+      name?: string;
+      file?: Blob;
+      assetRef?: string;
+      loop?: boolean;
+    }
+  | {
+      kind: 'system-audio';
+      name?: string;
+      targetHint?: string;
+    };
+
+export interface AddRealSourceResult {
+  ok: boolean;
+  source?: StudioSource;
+  layer?: SceneLayer | null;
+  entry?: SourceRuntimeEntry | null;
+  canceled?: boolean;
+  reason?: string;
+  platformCapability?: PlatformMediaCapabilities;
+}
+
+export interface RemoveSourceResult {
+  ok: boolean;
+  removed: boolean;
+  usageCount: number;
+  reason?: string;
 }
 
 export interface StudioCoordinatorOptions {
@@ -295,6 +437,7 @@ export class StudioCoordinator {
 
   private readonly storageAdapter: StudioStorageAdapter;
   private readonly saver: ReturnType<typeof createControlledProjectSaver>;
+  private readonly history = new CompositionHistory({ maxEntries: 40 });
   private readonly surfaceFactory: (width: number, height: number) => ProgramSurfaceLike;
   private readonly scheduler?: FrameSchedulerAdapter;
   private readonly now: () => number;
@@ -413,6 +556,10 @@ export class StudioCoordinator {
 
   getLastError(): string | null {
     return this.lastError;
+  }
+
+  getOutputDimensions(): { width: number; height: number } {
+    return { width: this.outputWidth, height: this.outputHeight };
   }
 
   /**
@@ -906,10 +1053,1281 @@ export class StudioCoordinator {
     this.compositor.setProcessedLayerSurface(camSrc.id, frame);
   }
 
+  getHistoryStatus(): CompositionHistoryStatus {
+    return this.history.getStatus();
+  }
+
+  beginCompositionGesture(label: string): void {
+    this.history.beginGesture(this.project, label);
+  }
+
+  commitCompositionGesture(label?: string): boolean {
+    const committed = this.history.commitGesture(this.project, label);
+    if (committed) {
+      this.onStateChange?.();
+    }
+    return committed;
+  }
+
+  cancelCompositionGesture(): void {
+    this.history.cancelGesture();
+  }
+
+  async undoComposition(): Promise<{ ok: boolean; label?: string; reason?: string }> {
+    if (this.disposed) {
+      return { ok: false, reason: 'Coordinador liberado.' };
+    }
+    const undone = this.history.undo();
+    if (!undone) {
+      return { ok: false, reason: 'No hay acciones para deshacer.' };
+    }
+    await this.applyCompositionSnapshot(undone.snapshot);
+    return { ok: true, label: undone.label };
+  }
+
+  async redoComposition(): Promise<{ ok: boolean; label?: string; reason?: string }> {
+    if (this.disposed) {
+      return { ok: false, reason: 'Coordinador liberado.' };
+    }
+    const redone = this.history.redo();
+    if (!redone) {
+      return { ok: false, reason: 'No hay acciones para rehacer.' };
+    }
+    await this.applyCompositionSnapshot(redone.snapshot);
+    return { ok: true, label: redone.label };
+  }
+
+  private async applyCompositionSnapshot(snapshot: {
+    scenes: StudioScene[];
+    activeSceneId: string;
+  }): Promise<void> {
+    const validSourceIds = new Set(this.project.sources.map((s) => s.id));
+    const sanitizedScenes = snapshot.scenes.map((scene) => ({
+      ...scene,
+      layers: scene.layers.filter((l) => validSourceIds.has(l.sourceId)),
+      audioSourceIds: scene.audioSourceIds.filter((id) => validSourceIds.has(id)),
+    }));
+    const resolvedActiveId = sanitizedScenes.some((s) => s.id === snapshot.activeSceneId)
+      ? snapshot.activeSceneId
+      : sanitizedScenes[0]?.id ?? this.project.activeSceneId;
+
+    const candidateProject: StudioProject = {
+      ...this.project,
+      scenes: sanitizedScenes,
+      activeSceneId: resolvedActiveId,
+      updatedAt: Date.now(),
+    };
+    const validation = validateProjectReferences(candidateProject);
+    if (!validation.valid) {
+      return;
+    }
+
+    this.project = candidateProject;
+    this.saver.schedule(this.project);
+
+    const activeScene = this.getActiveScene();
+    if (this.engineMode === 'studio' && activeScene) {
+      const byId = new Map(this.project.sources.map((s) => [s.id, s]));
+      const consumer = { id: COORDINATOR_CONSUMER_ID, kind: 'program-compositor' as const };
+      for (const layer of activeScene.layers) {
+        if (!layer.visible) continue;
+        const src = byId.get(layer.sourceId);
+        if (!src) continue;
+        const entry = this.sourceManager.getEntry(src.id);
+        if (entry?.state.status === 'paused') {
+          this.sourceManager.resumeSource(src.id);
+        } else if (
+          src.kind === 'color' ||
+          src.kind === 'gradient' ||
+          src.kind === 'text' ||
+          src.kind === 'image' ||
+          src.kind === 'video-file'
+        ) {
+          // Nunca dispara getUserMedia ni getDisplayMedia durante deshacer/rehacer
+          await this.sourceManager.acquireSource(src, consumer);
+        } else if (entry && entry.state.status === 'live') {
+          await this.sourceManager.acquireSource(src, consumer);
+        }
+      }
+    }
+
+    if (this.compositor) {
+      this.syncCompositorSceneAndRuntime();
+      this.reconcileSourceConsumersAfterTransition();
+      this.compositor.renderFrameNow();
+    }
+    this.onStateChange?.();
+  }
+
+  async enumerateAvailableDevices(): Promise<MediaDeviceDescriptor[]> {
+    return this.sourceManager.queryAvailableDevices();
+  }
+
+  /**
+   * Actualiza la transformación de una capa en una escena sin reiniciar pistas ni modificar ProgramCanvas.
+   * Respeta el bloqueo (`locked`) y los límites del lienzo [0, 1] con relación de aspecto proporcional.
+   */
+  updateSceneLayerTransform(
+    sceneId: string,
+    layerId: string,
+    transformPatch: Partial<LayerTransform>,
+    options?: { preserveAspectK?: number; historyGroupKey?: string; historyLabel?: string }
+  ): { ok: boolean; reason?: string; layer?: SceneLayer; constraintApplied?: boolean } {
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    const layer = scene?.layers.find((l) => l.id === layerId);
+    if (!scene || !layer) {
+      return { ok: false, reason: 'Capa o escena no encontrada.' };
+    }
+    if (layer.locked) {
+      return { ok: false, reason: 'La capa está bloqueada.' };
+    }
+
+    const merged = clampLayerTransform(transformPatch, layer.transform);
+    const source = this.project.sources.find((s) => s.id === layer.sourceId);
+
+    if (source && !isVisualSourceEditable(source)) {
+      return { ok: false, reason: 'Las fuentes de solo audio no admiten transformación visual.' };
+    }
+
+    let nextTransform = merged;
+    let constraintApplied = false;
+
+    if (!source || isVisualSourceEditable(source)) {
+      const clamped = clampVisualLayerTransformForScene(merged, {
+        scene,
+        layer,
+        sources: this.project.sources,
+        preserveAspectK: options?.preserveAspectK,
+      });
+      nextTransform = clamped.transform;
+      constraintApplied = clamped.constraintApplied;
+    }
+
+    const prevProject = this.project;
+    const nextProject = updateLayerTransform(this.project, sceneId, layerId, nextTransform);
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'No se pudo aplicar la transformación.' };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, {
+      label: options?.historyLabel ?? 'Transformar capa',
+      groupKey: options?.historyGroupKey,
+    });
+    this.saver.schedule(this.project);
+
+    const updatedScene = this.project.scenes.find((s) => s.id === sceneId);
+    const updatedLayer = updatedScene?.layers.find((l) => l.id === layerId);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return {
+      ok: true,
+      layer: updatedLayer,
+      constraintApplied,
+    };
+  }
+
+  /**
+   * Actualiza en vivo el estilo de una capa (forma, radio, borde, sombra, opacidad, difuminado alfa)
+   * sin reiniciar ninguna pista ni recrear la superficie de salida.
+   */
+  updateSceneLayerStyle(
+    sceneId: string,
+    layerId: string,
+    stylePatch: Partial<LayerStyle>,
+    options?: { historyGroupKey?: string; historyLabel?: string }
+  ): { ok: boolean; reason?: string; layer?: SceneLayer } {
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    const layer = scene?.layers.find((l) => l.id === layerId);
+    if (!scene || !layer) {
+      return { ok: false, reason: 'Capa o escena no encontrada.' };
+    }
+    if (layer.locked) {
+      return { ok: false, reason: 'La capa está bloqueada.' };
+    }
+
+    const prevProject = this.project;
+    const mergedStyle = clampLayerStyle(stylePatch, layer.style);
+    const nextProject = updateLayerStyle(this.project, sceneId, layerId, mergedStyle);
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'No se pudo aplicar el estilo.' };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, {
+      label: options?.historyLabel ?? 'Editar estilo de capa',
+      groupKey: options?.historyGroupKey,
+    });
+    this.saver.schedule(this.project);
+
+    const updatedScene = this.project.scenes.find((s) => s.id === sceneId);
+    const updatedLayer = updatedScene?.layers.find((l) => l.id === layerId);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return {
+      ok: true,
+      layer: updatedLayer,
+    };
+  }
+
+  /**
+   * Aplica un preset de composición adaptable únicamente ante una acción explícita del usuario.
+   * Nunca sobrescribe en segundo plano ajustes manuales previos.
+   */
+  applyAdaptableLayout(
+    sceneId: string,
+    layoutId: AdaptableSceneLayoutId,
+    options?: {
+      sensorWidth?: number;
+      sensorHeight?: number;
+      selectedLayerId?: string;
+      participatingLayerIds?: string[];
+      primaryDisplayLayerId?: string;
+      secondaryDisplayLayerId?: string;
+      primaryCameraLayerId?: string;
+      intrinsicWidth?: number;
+      intrinsicHeight?: number;
+    }
+  ): { ok: boolean; reason?: string; scene?: StudioScene } {
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    if (!scene) {
+      return { ok: false, reason: 'Escena no encontrada.' };
+    }
+
+    if (layoutId === 'freeform') {
+      return { ok: true, scene };
+    }
+
+    const selectedLayer = options?.selectedLayerId
+      ? scene.layers.find((l) => l.id === options.selectedLayerId)
+      : undefined;
+    const selectedRuntime = selectedLayer
+      ? this.sourceManager.getEntry(selectedLayer.sourceId)
+      : undefined;
+
+    const dims = this.getOutputDimensions();
+    const patches = computeAdaptableSceneLayout(scene, this.project.sources, layoutId, {
+      outputWidth: dims.width,
+      outputHeight: dims.height,
+      sensorWidth: options?.sensorWidth,
+      sensorHeight: options?.sensorHeight,
+      selectedLayerId: options?.selectedLayerId,
+      participatingLayerIds: options?.participatingLayerIds,
+      primaryDisplayLayerId: options?.primaryDisplayLayerId,
+      secondaryDisplayLayerId: options?.secondaryDisplayLayerId,
+      primaryCameraLayerId: options?.primaryCameraLayerId,
+      intrinsicWidth:
+        options?.intrinsicWidth ??
+        (selectedRuntime?.state.intrinsicWidth || undefined),
+      intrinsicHeight:
+        options?.intrinsicHeight ??
+        (selectedRuntime?.state.intrinsicHeight || undefined),
+    });
+
+    if (patches.size === 0) {
+      return { ok: false, reason: 'Sin cambios aplicables o capa bloqueada.' };
+    }
+
+    const prevProject = this.project;
+    let nextProject = updateMultipleLayerTransforms(this.project, sceneId, patches);
+
+    const updatedTargetScene = nextProject.scenes.find((s) => s.id === sceneId);
+    if (updatedTargetScene) {
+      const asc = [...updatedTargetScene.layers].sort((a, b) => a.zIndex - b.zIndex);
+      const sourceById = new Map(this.project.sources.map((s) => [s.id, s]));
+      const patchedIds = Array.from(patches.keys());
+      const camLayer =
+        (options?.primaryCameraLayerId
+          ? asc.find((l) => l.id === options.primaryCameraLayerId && patches.has(l.id))
+          : undefined) ??
+        asc.find((l) => patches.has(l.id) && sourceById.get(l.sourceId)?.kind === 'camera');
+      const primaryDisplay =
+        (options?.primaryDisplayLayerId
+          ? asc.find((l) => l.id === options.primaryDisplayLayerId && patches.has(l.id))
+          : undefined) ??
+        asc.find((l) => {
+          const k = sourceById.get(l.sourceId)?.kind;
+          return patches.has(l.id) && (k === 'window' || k === 'screen');
+        }) ??
+        asc.find((l) => patches.has(l.id) && l.id !== camLayer?.id);
+      const secondaryDisplay =
+        (options?.secondaryDisplayLayerId
+          ? asc.find((l) => l.id === options.secondaryDisplayLayerId && patches.has(l.id))
+          : undefined) ??
+        asc.find((l) => {
+          const k = sourceById.get(l.sourceId)?.kind;
+          return (
+            patches.has(l.id) &&
+            l.id !== primaryDisplay?.id &&
+            l.id !== camLayer?.id &&
+            (k === 'window' || k === 'screen' || patchedIds.length > 2)
+          );
+        });
+
+      let orderChanged = false;
+      const moveAbove = (lowerId: string | undefined, upperId: string | undefined) => {
+        if (!lowerId || !upperId || lowerId === upperId) return;
+        const lowerIdx = asc.findIndex((l) => l.id === lowerId);
+        const upperIdx = asc.findIndex((l) => l.id === upperId);
+        if (lowerIdx < 0 || upperIdx < 0 || asc[lowerIdx].locked || asc[upperIdx].locked) return;
+        if (upperIdx < lowerIdx) {
+          const [upperLayer] = asc.splice(upperIdx, 1);
+          const nextLowerIdx = asc.findIndex((l) => l.id === lowerId);
+          asc.splice(nextLowerIdx + 1, 0, upperLayer);
+          orderChanged = true;
+        }
+      };
+
+      if (
+        layoutId === 'pip-overlay' ||
+        layoutId === 'screen-main-cam-pip' ||
+        layoutId === 'screen-main-transparent-presenter'
+      ) {
+        moveAbove(primaryDisplay?.id, camLayer?.id);
+      } else if (layoutId === 'cam-main-window-pip') {
+        moveAbove(camLayer?.id, primaryDisplay?.id);
+      } else if (layoutId === 'screen-main-window-pip') {
+        moveAbove(primaryDisplay?.id, secondaryDisplay?.id);
+        if (camLayer && secondaryDisplay) {
+          moveAbove(secondaryDisplay.id, camLayer.id);
+        } else if (camLayer && primaryDisplay) {
+          moveAbove(primaryDisplay.id, camLayer.id);
+        }
+      }
+
+      if (orderChanged) {
+        nextProject = reorderSceneLayers(
+          nextProject,
+          sceneId,
+          asc.map((l) => l.id)
+        );
+      }
+    }
+
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'No se modificó la escena (capas bloqueadas).' };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, {
+      label: 'Aplicar composición',
+    });
+    this.saver.schedule(this.project);
+
+    const updatedScene = this.project.scenes.find((s) => s.id === sceneId);
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return {
+      ok: true,
+      scene: updatedScene,
+    };
+  }
+
+  /**
+   * Bloquea o desbloquea una capa en la escena indicada y persiste el cambio en studioStorage.
+   */
+  setSceneLayerLocked(sceneId: string, layerId: string, locked: boolean): boolean {
+    const prevProject = this.project;
+    const nextProject = setLayerLocked(this.project, sceneId, layerId, locked);
+    if (nextProject === this.project) return false;
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, {
+      label: locked ? 'Bloquear capa' : 'Desbloquear capa',
+    });
+    this.saver.schedule(this.project);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+      }
+    }
+
+    this.onStateChange?.();
+    return true;
+  }
+
+  reorderSceneLayers(
+    sceneId: string,
+    orderedLayerIds: string[]
+  ): { ok: boolean; scene?: StudioScene; reason?: string } {
+    const prevProject = this.project;
+    const nextProject = reorderSceneLayers(this.project, sceneId, orderedLayerIds);
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'No se pudo reordenar las capas.' };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, { label: 'Reordenar capas' });
+    this.saver.schedule(this.project);
+
+    const updatedScene = this.project.scenes.find((s) => s.id === sceneId);
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return { ok: true, scene: updatedScene };
+  }
+
+  moveSceneLayerOrder(
+    sceneId: string,
+    layerId: string,
+    direction: 'up' | 'down' | 'top' | 'bottom'
+  ): { ok: boolean; scene?: StudioScene; reason?: string } {
+    const prevProject = this.project;
+    const nextProject = moveLayerOrder(this.project, sceneId, layerId, direction);
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'La capa ya se encuentra en esa posición.' };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, { label: 'Reordenar capa' });
+    this.saver.schedule(this.project);
+
+    const updatedScene = this.project.scenes.find((s) => s.id === sceneId);
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return { ok: true, scene: updatedScene };
+  }
+
+  /**
+   * Coloca una capa visual inmediatamente detrás de la cámara visible inferior en la escena
+   * (o al fondo si no hay cámara visible). Registra historial reversible sin reiniciar pistas.
+   */
+  placeSceneLayerBehindCamera(
+    sceneId: string,
+    layerId: string
+  ): { ok: boolean; scene?: StudioScene; reason?: string } {
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    const target = scene?.layers.find((l) => l.id === layerId);
+    if (!scene || !target) {
+      return { ok: false, reason: 'Capa o escena no encontrada.' };
+    }
+
+    const asc = [...scene.layers].sort((a, b) => a.zIndex - b.zIndex);
+    const filtered = asc.filter((l) => l.id !== layerId);
+    const firstVisibleCamIdx = filtered.findIndex(
+      (l) =>
+        l.visible &&
+        this.project.sources.some((s) => s.id === l.sourceId && s.kind === 'camera')
+    );
+
+    if (firstVisibleCamIdx >= 0) {
+      filtered.splice(firstVisibleCamIdx, 0, target);
+    } else {
+      filtered.unshift(target);
+    }
+
+    const prevIds = asc.map((l) => l.id);
+    const nextIds = filtered.map((l) => l.id);
+    if (prevIds.every((id, idx) => id === nextIds[idx])) {
+      return { ok: true, scene };
+    }
+
+    return this.reorderSceneLayers(sceneId, nextIds);
+  }
+
+  async setSceneLayerVisible(
+    sceneId: string,
+    layerId: string,
+    visible: boolean
+  ): Promise<{ ok: boolean; layer?: SceneLayer; reason?: string }> {
+    const prevProject = this.project;
+    const nextProject = setLayerVisibility(this.project, sceneId, layerId, visible);
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'No cambió la visibilidad de la capa.' };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, {
+      label: visible ? 'Mostrar capa' : 'Ocultar capa',
+    });
+    this.saver.schedule(this.project);
+
+    const updatedScene = this.project.scenes.find((s) => s.id === sceneId);
+    const updatedLayer = updatedScene?.layers.find((l) => l.id === layerId);
+    const source = updatedLayer
+      ? this.project.sources.find((s) => s.id === updatedLayer.sourceId)
+      : undefined;
+
+    let infoMessage: string | undefined;
+    if (visible && source && this.engineMode === 'studio') {
+      const entry = this.sourceManager.getEntry(source.id);
+      if (entry?.state.status === 'paused') {
+        this.sourceManager.resumeSource(source.id);
+      } else if (source.kind === 'window' || source.kind === 'screen') {
+        if (!entry || entry.state.status === 'idle' || entry.state.status === 'disconnected' || entry.state.status === 'error') {
+          infoMessage = 'Capa visible: autoriza o reconecta la pantalla manualmente cuando desees.';
+        }
+      } else if (
+        source.kind === 'image' ||
+        source.kind === 'video-file' ||
+        source.kind === 'color' ||
+        source.kind === 'gradient' ||
+        source.kind === 'text' ||
+        source.kind === 'camera'
+      ) {
+        await this.sourceManager.acquireSource(source, {
+          id: COORDINATOR_CONSUMER_ID,
+          kind: 'program-compositor',
+        });
+      }
+    }
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.syncCompositorSceneAndRuntime();
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return { ok: true, layer: updatedLayer, reason: infoMessage };
+  }
+
+  renameSceneLayer(
+    sceneId: string,
+    layerId: string,
+    newName: string
+  ): { ok: boolean; layer?: SceneLayer; reason?: string } {
+    const trimmed = newName.trim();
+    if (!trimmed) {
+      return { ok: false, reason: 'El nombre de la capa no puede estar vacío.' };
+    }
+    const prevProject = this.project;
+    const nextProject = renameLayerInScene(this.project, sceneId, layerId, trimmed);
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'No se pudo renombrar la capa.' };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, { label: 'Renombrar capa' });
+    this.saver.schedule(this.project);
+
+    const updatedScene = this.project.scenes.find((s) => s.id === sceneId);
+    const updatedLayer = updatedScene?.layers.find((l) => l.id === layerId);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+      }
+    }
+
+    this.onStateChange?.();
+    return { ok: true, layer: updatedLayer };
+  }
+
+  duplicateSceneLayer(
+    sceneId: string,
+    layerId: string
+  ): { ok: boolean; layer?: SceneLayer | null; reason?: string } {
+    const prevProject = this.project;
+    const dupRes = duplicateLayerInScene(this.project, sceneId, layerId);
+    if (!dupRes.layer || dupRes.project === this.project) {
+      return { ok: false, layer: null, reason: 'No se pudo duplicar la capa.' };
+    }
+
+    this.project = dupRes.project;
+    this.history.recordChange(prevProject, this.project, { label: 'Duplicar capa' });
+    this.saver.schedule(this.project);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return { ok: true, layer: dupRes.layer };
+  }
+
+  resetSceneLayerTransform(
+    sceneId: string,
+    layerId: string
+  ): { ok: boolean; layer?: SceneLayer; reason?: string } {
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    const layer = scene?.layers.find((l) => l.id === layerId);
+    if (!scene || !layer) {
+      return { ok: false, reason: 'Capa o escena no encontrada.' };
+    }
+    if (layer.locked) {
+      return { ok: false, reason: 'La capa está bloqueada.' };
+    }
+
+    const prevProject = this.project;
+    const nextProject = resetLayerTransformInScene(this.project, sceneId, layerId);
+    if (nextProject === this.project) {
+      return { ok: true, layer };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, {
+      label: 'Restablecer transformación',
+    });
+    this.saver.schedule(this.project);
+
+    const updatedLayer = this.project.scenes
+      .find((s) => s.id === sceneId)
+      ?.layers.find((l) => l.id === layerId);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return { ok: true, layer: updatedLayer };
+  }
+
+  resetSceneLayerStyle(
+    sceneId: string,
+    layerId: string
+  ): { ok: boolean; layer?: SceneLayer; reason?: string } {
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    const layer = scene?.layers.find((l) => l.id === layerId);
+    if (!scene || !layer) {
+      return { ok: false, reason: 'Capa o escena no encontrada.' };
+    }
+    if (layer.locked) {
+      return { ok: false, reason: 'La capa está bloqueada.' };
+    }
+
+    const prevProject = this.project;
+    const nextProject = resetLayerStyleInScene(this.project, sceneId, layerId);
+    if (nextProject === this.project) {
+      return { ok: true, layer };
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, {
+      label: 'Restablecer apariencia',
+    });
+    this.saver.schedule(this.project);
+
+    const updatedLayer = this.project.scenes
+      .find((s) => s.id === sceneId)
+      ?.layers.find((l) => l.id === layerId);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene && activeScene.id === sceneId) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+        this.compositor.renderFrameNow();
+      }
+    }
+
+    this.onStateChange?.();
+    return { ok: true, layer: updatedLayer };
+  }
+
+  removeSceneLayer(
+    sceneId: string,
+    layerId: string
+  ): { ok: boolean; reason?: string } {
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    const layer = scene?.layers.find((l) => l.id === layerId);
+    if (!scene || !layer) {
+      return { ok: false, reason: 'Capa o escena no encontrada.' };
+    }
+
+    if (this.recordingLocked && sceneId === this.project.activeSceneId) {
+      const otherUsesInScene =
+        scene.layers.some((l) => l.id !== layerId && l.sourceId === layer.sourceId) ||
+        scene.audioSourceIds.includes(layer.sourceId);
+      const entry = this.sourceManager.getEntry(layer.sourceId);
+      if (!otherUsesInScene && entry?.state.status === 'live' && entry.details.hasAudioTrack) {
+        return {
+          ok: false,
+          reason:
+            'Bloqueado durante grabación activa: la capa aporta una pista de audio en directo.',
+        };
+      }
+    }
+
+    const prevProject = this.project;
+    const nextProject = removeLayerFromScene(this.project, sceneId, layerId);
+    if (nextProject === this.project) {
+      return { ok: false, reason: 'No se pudo quitar la capa de la escena.' };
+    }
+
+    // Nunca borra la fuente subyacente de `project.sources`: otras escenas pueden compartirla.
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, { label: 'Eliminar capa' });
+    this.saver.schedule(this.project);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      this.syncCompositorSceneAndRuntime();
+      this.reconcileSourceConsumersAfterTransition();
+      this.compositor.renderFrameNow();
+    }
+
+    this.onStateChange?.();
+    return { ok: true };
+  }
+
+  async addRealSourceToScene(
+    sceneId: string,
+    request: AddRealSourceRequest
+  ): Promise<AddRealSourceResult> {
+    if (this.disposed) {
+      return { ok: false, reason: 'Coordinador liberado.' };
+    }
+    const targetScene = this.project.scenes.find((s) => s.id === sceneId);
+    if (!targetScene) {
+      return { ok: false, reason: 'Escena no encontrada.' };
+    }
+
+    const platformCapability = this.sourceManager.getPlatformCapabilities();
+    const consumer = { id: COORDINATOR_CONSUMER_ID, kind: 'program-compositor' as const };
+    const prevProject = this.project;
+
+    if (request.kind === 'system-audio') {
+      const liveDonor = this.sourceManager
+        .listEntries()
+        .find(
+          (e) =>
+            (e.source.kind === 'window' || e.source.kind === 'screen') &&
+            (e.state.status === 'live' || e.state.status === 'paused') &&
+            Boolean(e.resources.mediaStream?.getAudioTracks().length) &&
+            (!request.targetHint ||
+              e.source.name.toLowerCase().includes(request.targetHint.toLowerCase()))
+        );
+
+      if (!liveDonor) {
+        const msg =
+          platformCapability.platform === 'darwin' ||
+          !platformCapability.supportsPerAppIsolatedAudioOnMacOS
+            ? 'En macOS el audio del sistema requiere compartir primero una pantalla o ventana con la opción de audio activada.'
+            : 'No hay ninguna fuente de pantalla o ventana compartiendo audio del sistema en este momento.';
+        return {
+          ok: false,
+          reason: msg,
+          platformCapability,
+        };
+      }
+
+      const addedSys = addSource(this.project, {
+        kind: 'system-audio',
+        name: request.name?.trim() || `Audio del sistema (${liveDonor.source.name})`,
+        targetHint: request.targetHint,
+      });
+      const updatedProject: StudioProject = {
+        ...addedSys.project,
+        scenes: addedSys.project.scenes.map((s) =>
+          s.id === sceneId && !s.audioSourceIds.includes(addedSys.source.id)
+            ? { ...s, audioSourceIds: [...s.audioSourceIds, addedSys.source.id], updatedAt: Date.now() }
+            : s
+        ),
+      };
+      this.project = updatedProject;
+      this.sourceManager.syncProjectDefinitions(this.project);
+      const entry = await this.sourceManager.acquireSource(addedSys.source, consumer, {
+        linkedDisplaySourceId: liveDonor.source.id,
+        retryOnError: true,
+      });
+      if (entry.state.status !== 'live') {
+        this.project = prevProject;
+        this.sourceManager.releaseSource(addedSys.source.id, COORDINATOR_CONSUMER_ID);
+        this.sourceManager.syncProjectDefinitions(this.project);
+        this.onStateChange?.();
+        return {
+          ok: false,
+          entry,
+          reason: entry.state.errorMessage || 'Audio del sistema no disponible.',
+          platformCapability,
+        };
+      }
+      this.history.recordChange(prevProject, this.project, { label: 'Añadir audio del sistema' });
+      this.saver.schedule(this.project);
+      this.syncCompositorSceneAndRuntime();
+      this.onStateChange?.();
+      return { ok: true, source: addedSys.source, entry, platformCapability };
+    }
+
+    let uploadedAssetRef: string | null = null;
+    try {
+      let added: { project: StudioProject; source: StudioSource };
+      let layerTransform: Partial<LayerTransform> = { x: 0.15, y: 0.15, width: 0.7, height: 0.7, fitMode: 'contain' };
+      let layerStyle: Partial<LayerStyle> | undefined;
+      let isAudioOnly = false;
+
+      if (request.kind === 'image') {
+        const assetRef = request.file
+          ? await saveStudioAssetBlob(request.file)
+          : request.assetRef?.trim() || '';
+        if (!assetRef) {
+          return { ok: false, reason: 'Selecciona una imagen válida para añadir a la escena.' };
+        }
+        if (request.file) uploadedAssetRef = assetRef;
+        added = addSource(this.project, {
+          kind: 'image',
+          name:
+            request.name?.trim() ||
+            (request.file instanceof File && request.file.name ? request.file.name : 'Imagen'),
+          assetRef,
+          intrinsicWidth: request.intrinsicWidth,
+          intrinsicHeight: request.intrinsicHeight,
+        });
+      } else if (request.kind === 'video-file') {
+        const assetRef = request.file
+          ? await saveStudioAssetBlob(request.file)
+          : request.assetRef?.trim() || '';
+        if (!assetRef) {
+          return { ok: false, reason: 'Selecciona un archivo de vídeo válido.' };
+        }
+        if (request.file) uploadedAssetRef = assetRef;
+        added = addSource(this.project, {
+          kind: 'video-file',
+          name:
+            request.name?.trim() ||
+            (request.file instanceof File && request.file.name ? request.file.name : 'Vídeo local'),
+          assetRef,
+          loop: request.loop ?? true,
+          playbackRate: request.playbackRate ?? 1,
+          mutedByDefault: request.mutedByDefault ?? true,
+        });
+      } else if (request.kind === 'audio-file') {
+        isAudioOnly = true;
+        const assetRef = request.file
+          ? await saveStudioAssetBlob(request.file)
+          : request.assetRef?.trim() || '';
+        if (!assetRef) {
+          return { ok: false, reason: 'Selecciona un archivo de audio válido.' };
+        }
+        if (request.file) uploadedAssetRef = assetRef;
+        added = addSource(this.project, {
+          kind: 'audio-file',
+          name:
+            request.name?.trim() ||
+            (request.file instanceof File && request.file.name ? request.file.name : 'Audio local'),
+          assetRef,
+          loop: request.loop ?? false,
+        });
+      } else if (request.kind === 'text') {
+        layerTransform = { x: 0.1, y: 0.74, width: 0.8, height: 0.18, fitMode: 'contain' };
+        layerStyle = { maskShape: 'rounded', borderRadiusPx: 16 };
+        added = addSource(this.project, {
+          kind: 'text',
+          name: request.name?.trim() || request.text.trim().slice(0, 28) || 'Rótulo de texto',
+          text: request.text.trim() || 'Texto en vivo',
+          subtitle: request.subtitle?.trim(),
+          fontFamily: request.fontFamily ?? 'sans',
+          fontSizePx: request.fontSizePx ?? 42,
+          textColor: request.textColor ?? '#ffffff',
+          accentColor: request.accentColor ?? '#38bdf8',
+          glassBackdrop: request.glassBackdrop ?? true,
+          align: request.align ?? 'center',
+        });
+      } else if (request.kind === 'color') {
+        layerTransform = { x: 0, y: 0, width: 1, height: 1, fitMode: 'stretch' };
+        added = addSource(this.project, {
+          kind: 'color',
+          name: request.name?.trim() || `Color ${request.color}`,
+          color: request.color,
+        });
+      } else if (request.kind === 'gradient') {
+        layerTransform = { x: 0, y: 0, width: 1, height: 1, fitMode: 'stretch' };
+        added = addSource(this.project, {
+          kind: 'gradient',
+          name: request.name?.trim() || 'Fondo degradado',
+          startColor: request.startColor,
+          endColor: request.endColor,
+          angleDeg: request.angleDeg ?? 135,
+        });
+      } else if (request.kind === 'camera') {
+        layerTransform = { x: 0.66, y: 0.62, width: 0.3, height: 0.3, fitMode: 'cover' };
+        layerStyle = { maskShape: 'rounded', borderRadiusPx: 18 };
+        const baseCamName = request.name?.trim() || request.deviceLabelHint?.trim() || 'Cámara';
+        const camCount = this.project.sources.filter((s) => s.kind === 'camera').length;
+        const resolvedCamName =
+          request.name?.trim() ||
+          request.deviceLabelHint?.trim() ||
+          (camCount === 0 ? baseCamName : `${baseCamName} ${camCount + 1}`);
+        added = addSource(this.project, {
+          kind: 'camera',
+          name: resolvedCamName,
+          deviceId: request.deviceId || 'default',
+          deviceLabelHint: request.deviceLabelHint,
+          preferredWidth: request.preferredWidth ?? 1920,
+          preferredHeight: request.preferredHeight ?? 1080,
+          preferredFps: request.preferredFps ?? 30,
+        });
+      } else if (request.kind === 'microphone') {
+        isAudioOnly = true;
+        const micCount = this.project.sources.filter((s) => s.kind === 'microphone').length;
+        const resolvedMicName =
+          request.name?.trim() ||
+          request.deviceLabelHint?.trim() ||
+          (micCount === 0 ? 'Micrófono' : `Micrófono ${micCount + 1}`);
+        added = addSource(this.project, {
+          kind: 'microphone',
+          name: resolvedMicName,
+          deviceId: request.deviceId || 'default',
+          deviceLabelHint: request.deviceLabelHint,
+          echoCancellation: request.echoCancellation ?? true,
+          noiseSuppression: request.noiseSuppression ?? true,
+        });
+      } else if (request.kind === 'window') {
+        layerTransform = { x: 0.05, y: 0.05, width: 0.9, height: 0.9, fitMode: 'contain' };
+        const winCount = this.project.sources.filter((s) => s.kind === 'window').length;
+        const resolvedWinName =
+          request.name?.trim() ||
+          (winCount === 0 ? 'Ventana de aplicación' : `Ventana de aplicación ${winCount + 1}`);
+        added = addSource(this.project, {
+          kind: 'window',
+          name: resolvedWinName,
+          sourceTitleHint: request.sourceTitleHint,
+          includeSystemAudio: request.includeSystemAudio ?? true,
+        });
+      } else {
+        layerTransform = { x: 0, y: 0, width: 1, height: 1, fitMode: 'contain' };
+        const screenCount = this.project.sources.filter((s) => s.kind === 'screen').length;
+        const resolvedScreenName =
+          request.name?.trim() ||
+          (screenCount === 0 ? 'Pantalla compartida' : `Pantalla compartida ${screenCount + 1}`);
+        added = addSource(this.project, {
+          kind: 'screen',
+          name: resolvedScreenName,
+          displayNameHint: request.displayNameHint,
+          includeSystemAudio: request.includeSystemAudio ?? true,
+        });
+      }
+
+      let nextProject = added.project;
+      let addedLayer: SceneLayer | null = null;
+      if (isAudioOnly) {
+        nextProject = {
+          ...nextProject,
+          scenes: nextProject.scenes.map((s) =>
+            s.id === sceneId
+              ? { ...s, audioSourceIds: [...s.audioSourceIds, added.source.id], updatedAt: Date.now() }
+              : s
+          ),
+        };
+      } else {
+        const layerRes = addLayerToScene(nextProject, sceneId, added.source.id, {
+          name: added.source.name,
+          transform: layerTransform,
+          style: layerStyle,
+        });
+        nextProject = layerRes.project;
+        addedLayer = layerRes.layer;
+        if (addedLayer && (request.kind === 'screen' || request.kind === 'window') && request.placement === 'behind-camera') {
+          const scene = nextProject.scenes.find(s => s.id === sceneId)!;
+          const ordered = [...scene.layers].sort((a,b) => a.zIndex-b.zIndex).filter(l => l.id !== addedLayer!.id);
+          const cameraIndex = ordered.findIndex(l => l.visible && nextProject.sources.some(s => s.id === l.sourceId && s.kind === 'camera'));
+          if (cameraIndex >= 0) {
+            ordered.splice(cameraIndex, 0, addedLayer);
+            nextProject = reorderSceneLayers(nextProject, sceneId, ordered.map(l => l.id));
+            addedLayer = nextProject.scenes.find(s => s.id === sceneId)!.layers.find(l => l.id === addedLayer!.id)!;
+          }
+        }
+      }
+
+      this.project = nextProject;
+      this.sourceManager.syncProjectDefinitions(this.project);
+
+      let entry: SourceRuntimeEntry | null = null;
+      if (added.source.kind === 'window' || added.source.kind === 'screen') {
+        entry = await this.authorizeDisplaySource(added.source.id);
+      } else {
+        entry = await this.sourceManager.acquireSource(added.source, consumer, { retryOnError: true });
+      }
+
+      if (!entry || entry.state.status !== 'live') {
+        const isCanceled = entry?.details.errorCode === 'user-canceled';
+        const reason =
+          entry?.state.errorMessage ||
+          (isCanceled ? 'Selección cancelada por el usuario.' : 'No se pudo iniciar la fuente.');
+        this.project = prevProject;
+        this.sourceManager.releaseSource(added.source.id, COORDINATOR_CONSUMER_ID);
+        this.sourceManager.syncProjectDefinitions(this.project);
+        if (uploadedAssetRef) {
+          await deleteStudioAssetBlob(uploadedAssetRef);
+        }
+        this.syncCompositorSceneAndRuntime();
+        this.onStateChange?.();
+        return {
+          ok: false,
+          canceled: isCanceled,
+          entry,
+          reason,
+          platformCapability,
+        };
+      }
+
+      this.history.recordChange(prevProject, this.project, { label: `Añadir ${added.source.name}` });
+      this.saver.schedule(this.project);
+      this.syncCompositorSceneAndRuntime();
+      this.compositor?.renderFrameNow();
+      this.onStateChange?.();
+      return {
+        ok: true,
+        source: added.source,
+        layer: addedLayer,
+        entry,
+        platformCapability,
+      };
+    } catch (err) {
+      this.project = prevProject;
+      this.sourceManager.syncProjectDefinitions(this.project);
+      if (uploadedAssetRef) {
+        await deleteStudioAssetBlob(uploadedAssetRef);
+      }
+      this.onStateChange?.();
+      return {
+        ok: false,
+        reason: err instanceof Error ? err.message : 'No se pudo añadir la fuente.',
+        platformCapability,
+      };
+    }
+  }
+
+  /**
+   * Renombra una fuente persistente del proyecto sin interrumpir pistas activas ni reiniciar ProgramCanvas.
+   */
+  renameProjectSource(
+    sourceId: string,
+    newName: string
+  ): { ok: boolean; source?: StudioSource; reason?: string } {
+    const trimmed = newName.trim();
+    if (!trimmed) {
+      return { ok: false, reason: 'El nombre de la fuente no puede estar vacío.' };
+    }
+    const existing = this.project.sources.find((s) => s.id === sourceId);
+    if (!existing) {
+      return { ok: false, reason: 'Fuente no encontrada en el proyecto.' };
+    }
+    if (existing.name === trimmed) {
+      return { ok: true, source: existing };
+    }
+
+    const nextProject = updateSource(this.project, sourceId, (src) => ({
+      ...src,
+      name: trimmed,
+    }));
+    this.project = nextProject;
+    this.sourceManager.syncProjectDefinitions(this.project);
+    this.saver.schedule(this.project);
+
+    if (this.engineMode === 'studio' && this.compositor) {
+      const activeScene = this.getActiveScene();
+      if (activeScene) {
+        this.compositor.setSceneData(activeScene, this.project.sources);
+      }
+    }
+
+    this.onStateChange?.();
+    return {
+      ok: true,
+      source: this.project.sources.find((s) => s.id === sourceId),
+    };
+  }
+
+  /**
+   * Incorpora una fuente existente del proyecto como capa independiente en una escena
+   * sin duplicar hardware ni abrir selectores del sistema si ya está activa.
+   */
+  async addExistingSourceToScene(
+    sceneId: string,
+    sourceId: string,
+    options?: { placement?: 'behind-camera' | 'top'; name?: string }
+  ): Promise<AddRealSourceResult> {
+    if (this.disposed) {
+      return { ok: false, reason: 'Coordinador liberado.' };
+    }
+    const scene = this.project.scenes.find((s) => s.id === sceneId);
+    const source = this.project.sources.find((s) => s.id === sourceId);
+    if (!scene || !source) {
+      return { ok: false, reason: 'Escena o fuente no encontrada.' };
+    }
+
+    const prevProject = this.project;
+    let nextProject = prevProject;
+    let addedLayer: SceneLayer | null = null;
+
+    if (
+      source.kind === 'microphone' ||
+      source.kind === 'audio-file' ||
+      source.kind === 'system-audio'
+    ) {
+      if (!scene.audioSourceIds.includes(source.id)) {
+        nextProject = {
+          ...nextProject,
+          scenes: nextProject.scenes.map((s) =>
+            s.id === sceneId
+              ? { ...s, audioSourceIds: [...s.audioSourceIds, source.id], updatedAt: Date.now() }
+              : s
+          ),
+        };
+      }
+    } else {
+      const defaultTransform: Partial<LayerTransform> =
+        source.kind === 'screen'
+          ? { x: 0, y: 0, width: 1, height: 1, fitMode: 'contain' }
+          : source.kind === 'window'
+            ? { x: 0.05, y: 0.05, width: 0.9, height: 0.9, fitMode: 'contain' }
+            : source.kind === 'camera'
+              ? { x: 0.66, y: 0.62, width: 0.3, height: 0.3, fitMode: 'cover' }
+              : { x: 0.15, y: 0.15, width: 0.7, height: 0.7, fitMode: 'contain' };
+
+      const layerRes = addLayerToScene(nextProject, sceneId, source.id, {
+        name: options?.name?.trim() || source.name,
+        transform: defaultTransform,
+      });
+      nextProject = layerRes.project;
+      addedLayer = layerRes.layer;
+
+      if (addedLayer && options?.placement === 'behind-camera') {
+        const targetScene = nextProject.scenes.find((s) => s.id === sceneId)!;
+        const asc = [...targetScene.layers]
+          .sort((a, b) => a.zIndex - b.zIndex)
+          .filter((l) => l.id !== addedLayer!.id);
+        const camIdx = asc.findIndex(
+          (l) =>
+            l.visible &&
+            nextProject.sources.some((s) => s.id === l.sourceId && s.kind === 'camera')
+        );
+        if (camIdx >= 0) {
+          asc.splice(camIdx, 0, addedLayer);
+          nextProject = reorderSceneLayers(
+            nextProject,
+            sceneId,
+            asc.map((l) => l.id)
+          );
+          addedLayer =
+            nextProject.scenes
+              .find((s) => s.id === sceneId)
+              ?.layers.find((l) => l.id === addedLayer!.id) ?? addedLayer;
+        }
+      }
+    }
+
+    this.project = nextProject;
+    this.history.recordChange(prevProject, this.project, { label: `Añadir ${source.name}` });
+    this.saver.schedule(this.project);
+
+    const existingEntry = this.sourceManager.getEntry(source.id);
+    if (
+      this.engineMode === 'studio' &&
+      source.kind !== 'window' &&
+      source.kind !== 'screen' &&
+      source.kind !== 'system-audio'
+    ) {
+      await this.sourceManager.acquireSource(source, {
+        id: COORDINATOR_CONSUMER_ID,
+        kind: 'program-compositor',
+      });
+    } else if (existingEntry && existingEntry.state.status === 'live') {
+      await this.sourceManager.acquireSource(source, {
+        id: COORDINATOR_CONSUMER_ID,
+        kind: 'program-compositor',
+      });
+    }
+
+    this.syncCompositorSceneAndRuntime();
+    this.compositor?.renderFrameNow();
+    this.onStateChange?.();
+    return {
+      ok: true,
+      source,
+      layer: addedLayer,
+      entry: this.sourceManager.getEntry(source.id),
+    };
+  }
+
+  async removeProjectSourceSafely(sourceId: string): Promise<RemoveSourceResult> {
+    if (this.recordingLocked) {
+      return {
+        ok: false,
+        removed: false,
+        usageCount: 0,
+        reason: 'Bloqueado durante grabación activa.',
+      };
+    }
+    const target = this.project.sources.find((s) => s.id === sourceId);
+    const res = removeSourceSafely(this.project, sourceId);
+    if (!res.removed) {
+      return {
+        ok: false,
+        removed: false,
+        usageCount: res.usageCount,
+        reason:
+          res.reason === 'source-in-use'
+            ? `La fuente sigue en uso en ${res.usageCount} capa(s) o escena(s). Quita primero las capas que la usan.`
+            : 'Fuente no encontrada en el proyecto.',
+      };
+    }
+
+    this.project = res.project;
+    this.sourceManager.releaseSource(sourceId, COORDINATOR_CONSUMER_ID);
+    this.sourceManager.syncProjectDefinitions(this.project);
+    if (
+      target &&
+      (target.kind === 'image' || target.kind === 'video-file' || target.kind === 'audio-file') &&
+      isStudioAssetRef(target.assetRef)
+    ) {
+      await deleteStudioAssetBlob(target.assetRef);
+    }
+
+    this.saver.schedule(this.project);
+    this.syncCompositorRuntime();
+    this.onStateChange?.();
+    return {
+      ok: true,
+      removed: true,
+      usageCount: 0,
+    };
+  }
+
   async resetProjectToStarter(): Promise<void> {
     if (this.recordingLocked) return;
 
     this.saver.cancel();
+    this.history.clear();
     this.sourceManager.releaseConsumer(COORDINATOR_CONSUMER_ID);
     const fresh = createStarterStudioProject(
       this.project.recordingProfile.resolutionPreset,

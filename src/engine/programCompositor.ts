@@ -70,6 +70,7 @@ export interface LayerRenderGeometry {
   borderRadiusPx: number;
   borderWidthPx: number;
   shadowBlurPx: number;
+  featherPx: number;
   /** Factor de escala respecto a altura/lado menor de referencia 1080p. */
   resolutionScale: number;
 }
@@ -302,9 +303,12 @@ export function computeLayerRenderGeometry(
   const boxX = anchorCanvasX - t.anchorX * boxW;
   const boxY = anchorCanvasY - t.anchorY * boxH;
 
-  // 3. Modo de ajuste (`contain`, `cover`, `stretch`)
+  // 3. Modo de ajuste (`contain`, `cover`, `stretch`) y encuadre interno (`contentZoom`, `contentOffsetX/Y`)
   const srcAspect = sw / sh;
   const boxAspect = boxW / boxH;
+  const contentZoom = clamp(t.contentZoom ?? 1, 1, 4);
+  const contentOffsetX = clamp(t.contentOffsetX ?? 0, -1, 1);
+  const contentOffsetY = clamp(t.contentOffsetY ?? 0, -1, 1);
 
   let contentLocalRect = { x: 0, y: 0, width: boxW, height: boxH };
 
@@ -326,21 +330,40 @@ export function computeLayerRenderGeometry(
         height: boxH,
       };
     }
-  } else if (t.fitMode === 'cover') {
-    if (srcAspect > boxAspect) {
-      const visibleSw = sh * boxAspect;
-      sx += (sw - visibleSw) * 0.5;
-      sw = visibleSw;
-    } else {
-      const visibleSh = sw / boxAspect;
-      sy += (sh - visibleSh) * 0.5;
-      sh = visibleSh;
+
+    if (contentZoom > 1.001) {
+      const zoomedSw = sw / contentZoom;
+      const zoomedSh = sh / contentZoom;
+      const slackX = (sw - zoomedSw) * 0.5;
+      const slackY = (sh - zoomedSh) * 0.5;
+      sx += slackX + contentOffsetX * slackX;
+      sy += slackY + contentOffsetY * slackY;
+      sw = zoomedSw;
+      sh = zoomedSh;
     }
+  } else if (t.fitMode === 'cover') {
+    let baseVisSw = sw;
+    let baseVisSh = sh;
+    if (srcAspect > boxAspect) {
+      baseVisSw = sh * boxAspect;
+    } else {
+      baseVisSh = sw / boxAspect;
+    }
+    const zoomedSw = baseVisSw / contentZoom;
+    const zoomedSh = baseVisSh / contentZoom;
+    const slackX = Math.max(0, (sw - zoomedSw) * 0.5);
+    const slackY = Math.max(0, (sh - zoomedSh) * 0.5);
+    sx += slackX + contentOffsetX * slackX;
+    sy += slackY + contentOffsetY * slackY;
+    sw = zoomedSw;
+    sh = zoomedSh;
   }
   // En 'stretch' se conserva sourceRect completo y contentLocalRect llena (0, 0, boxW, boxH)
 
   // 4. Escala proporcional de acabados respecto a 1080p
   const resolutionScale = Math.min(safeOutW, safeOutH) / 1080;
+  const effectiveBorderWidth =
+    layer.style.borderEnabled === false ? 0 : layer.style.borderWidthPx;
 
   return {
     layerId: layer.id,
@@ -353,8 +376,9 @@ export function computeLayerRenderGeometry(
     flipH: t.flipH,
     flipV: t.flipV,
     borderRadiusPx: layer.style.borderRadiusPx * resolutionScale,
-    borderWidthPx: layer.style.borderWidthPx * resolutionScale,
+    borderWidthPx: effectiveBorderWidth * resolutionScale,
     shadowBlurPx: layer.style.shadowBlurPx * resolutionScale,
+    featherPx: Math.max(0, layer.style.featherPx ?? 0) * resolutionScale,
     resolutionScale,
   };
 }
@@ -385,6 +409,128 @@ export function compositeStraightAlphaPixel(
   ];
 }
 
+function sdRoundedBoxCpu(px: number, py: number, bx: number, by: number, r: number): number {
+  const qx = Math.abs(px) - bx + r;
+  const qy = Math.abs(py) - by + r;
+  const ox = Math.max(qx, 0);
+  const oy = Math.max(qy, 0);
+  return Math.min(Math.max(qx, qy), 0) + Math.hypot(ox, oy) - r;
+}
+
+/**
+ * Distancia firmada en píxeles respecto al borde de cualquiera de las 6 formas de máscara.
+ * Negativo = dentro de la máscara; 0 = borde exacto; Positivo = fuera.
+ */
+export function computeSignedMaskDistancePx(
+  px: number,
+  py: number,
+  width: number,
+  height: number,
+  maskShape: LayerMaskShape,
+  borderRadiusPx: number
+): number {
+  const hx = Math.max(1, width * 0.5);
+  const hy = Math.max(1, height * 0.5);
+  const dx = px - hx;
+  const dy = py - hy;
+
+  if (maskShape === 'circle') {
+    const r = Math.min(hx, hy);
+    return Math.hypot(dx, dy) - r;
+  }
+
+  if (maskShape === 'ellipse') {
+    const qx = dx / hx;
+    const qy = dy / hy;
+    const k0 = Math.hypot(qx, qy);
+    if (k0 < 0.0001) return -Math.min(hx, hy);
+    const k1 = Math.hypot(qx / hx, qy / hy);
+    return (k0 * (k0 - 1)) / Math.max(0.0001, k1);
+  }
+
+  if (maskShape === 'square') {
+    const sideHalf = Math.min(hx, hy);
+    const sr = Math.min(Math.max(0, borderRadiusPx), sideHalf);
+    if (sr <= 0.5) {
+      const qx = Math.abs(dx) - sideHalf;
+      const qy = Math.abs(dy) - sideHalf;
+      return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0);
+    }
+    return sdRoundedBoxCpu(dx, dy, sideHalf, sideHalf, sr);
+  }
+
+  if (maskShape === 'rect' || borderRadiusPx <= 0.5) {
+    const qx = Math.abs(dx) - hx;
+    const qy = Math.abs(dy) - hy;
+    return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0);
+  }
+
+  const maxR = Math.min(hx, hy);
+  const r = Math.min(borderRadiusPx, maxR);
+
+  if (maskShape === 'squircle') {
+    const sr = Math.min(maxR, r * 1.35);
+    const innerX = Math.max(hx - sr, 0.001);
+    const innerY = Math.max(hy - sr, 0.001);
+    const ex = Math.max(Math.abs(dx) - innerX, 0);
+    const ey = Math.max(Math.abs(dy) - innerY, 0);
+    if (ex === 0 && ey === 0) {
+      return Math.max(Math.abs(dx) - hx, Math.abs(dy) - hy);
+    }
+    const nx = ex / sr;
+    const ny = ey / sr;
+    const p4 = Math.pow(Math.pow(nx, 4) + Math.pow(ny, 4), 0.25);
+    return (p4 - 1) * sr;
+  }
+
+  return sdRoundedBoxCpu(dx, dy, hx, hy, r);
+}
+
+/**
+ * Curva suave hermítica hacia el interior para el difuminado alfa perimetral sin halos.
+ */
+export function computeNormalizedFeatherAlpha(distPx: number, featherPx: number): number {
+  const aa = 1.0;
+  const edgeT = clamp((distPx + aa) / (2 * aa), 0, 1);
+  const edgeAlpha = 1 - edgeT * edgeT * (3 - 2 * edgeT);
+  if (edgeAlpha <= 0) return 0;
+  if (featherPx <= 0.25) return edgeAlpha;
+
+  const t = clamp(-distPx / Math.max(0.001, featherPx), 0, 1);
+  const featherAlpha = t * t * (3 - 2 * t);
+  return edgeAlpha * featherAlpha;
+}
+
+/**
+ * Aplica difuminado perimetral en alpha recto sobre un buffer RGBA sin alterar los canales RGB.
+ */
+export function applyPerimeterFeatherToRgbaBuffer(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  maskShape: LayerMaskShape,
+  borderRadiusPx: number,
+  featherPx: number
+): void {
+  const safeW = Math.max(1, Math.floor(width));
+  const safeH = Math.max(1, Math.floor(height));
+  for (let y = 0; y < safeH; y++) {
+    for (let x = 0; x < safeW; x++) {
+      const dist = computeSignedMaskDistancePx(
+        x + 0.5,
+        y + 0.5,
+        safeW,
+        safeH,
+        maskShape,
+        borderRadiusPx
+      );
+      const maskA = computeNormalizedFeatherAlpha(dist, featherPx);
+      const idx = (y * safeW + x) * 4;
+      data[idx + 3] = Math.round(data[idx + 3] * maskA);
+    }
+  }
+}
+
 export function isVisualSourceKind(kind: StudioSource['kind']): boolean {
   return kind !== 'microphone' && kind !== 'system-audio' && kind !== 'audio-file';
 }
@@ -408,6 +554,38 @@ export function traceMaskPathOn2dContext(
   if (maskShape === 'circle') {
     const r = Math.min(width, height) * 0.5;
     ctx.arc(width * 0.5, height * 0.5, r, 0, Math.PI * 2);
+    ctx.closePath();
+    return;
+  }
+
+  if (maskShape === 'ellipse') {
+    const rx = width * 0.5;
+    const ry = height * 0.5;
+    if (typeof ctx.ellipse === 'function') {
+      ctx.ellipse(rx, ry, rx, ry, 0, 0, Math.PI * 2);
+    } else {
+      ctx.save();
+      ctx.translate(rx, ry);
+      ctx.scale(rx, ry);
+      ctx.arc(0, 0, 1, 0, Math.PI * 2);
+      ctx.restore();
+    }
+    ctx.closePath();
+    return;
+  }
+
+  if (maskShape === 'square') {
+    const side = Math.min(width, height);
+    const sx = (width - side) * 0.5;
+    const sy = (height - side) * 0.5;
+    const r = Math.min(Math.max(0, borderRadiusPx), side * 0.5);
+    if (r <= 0.5) {
+      ctx.rect(sx, sy, side, side);
+    } else if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(sx, sy, side, side, r);
+    } else {
+      ctx.rect(sx, sy, side, side);
+    }
     ctx.closePath();
     return;
   }
@@ -609,12 +787,20 @@ uniform vec4 u_srcUvRect;
 uniform int u_useSolidColor;
 uniform vec4 u_solidColor;
 uniform vec2 u_boxSizePx;
+uniform vec2 u_quadSizePx;
+uniform vec2 u_quadPaddingPx;
 uniform vec2 u_contentMinUv;
 uniform vec2 u_contentMaxUv;
-uniform int u_maskShape; // 0=rect, 1=rounded, 2=circle, 3=squircle
+uniform int u_maskShape; // 0=rect, 1=rounded, 2=circle, 3=squircle, 4=square, 5=ellipse
 uniform float u_borderRadiusPx;
 uniform float u_borderWidthPx;
 uniform vec4 u_borderColor;
+uniform float u_featherPx;
+uniform int u_renderPass; // 0=content, 1=shadow
+uniform vec4 u_shadowColor;
+uniform float u_shadowBlurPx;
+uniform float u_shadowOpacity;
+uniform int u_hasTransparentAlpha;
 uniform float u_opacity;
 uniform int u_alphaMode; // 0=straight, 1=premultiplied
 
@@ -638,6 +824,17 @@ float sdSquircleBox(vec2 p, vec2 b, float r) {
   return (p4 - 1.0) * r;
 }
 
+float sdEllipsePx(vec2 p, vec2 ab) {
+  vec2 safeAb = max(ab, vec2(1.0));
+  vec2 q = p / safeAb;
+  float k0 = length(q);
+  if (k0 < 0.0001) {
+    return -min(safeAb.x, safeAb.y);
+  }
+  float k1 = length(q / safeAb);
+  return (k0 * (k0 - 1.0)) / max(k1, 0.0001);
+}
+
 float computeMaskDistance(vec2 pxPos, vec2 sizePx) {
   vec2 halfSize = sizePx * 0.5;
   vec2 p = pxPos - halfSize;
@@ -645,6 +842,18 @@ float computeMaskDistance(vec2 pxPos, vec2 sizePx) {
   if (u_maskShape == 2) {
     float rad = min(halfSize.x, halfSize.y);
     return length(p) - rad;
+  }
+  if (u_maskShape == 5) {
+    return sdEllipsePx(p, halfSize);
+  }
+  if (u_maskShape == 4) {
+    float sideHalf = min(halfSize.x, halfSize.y);
+    float sr = min(u_borderRadiusPx, sideHalf);
+    if (sr <= 0.5) {
+      vec2 d = abs(p) - vec2(sideHalf);
+      return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+    }
+    return sdRoundedBox(p, vec2(sideHalf), sr);
   }
   if (u_maskShape == 0 || u_borderRadiusPx <= 0.5) {
     vec2 d = abs(p) - halfSize;
@@ -658,10 +867,30 @@ float computeMaskDistance(vec2 pxPos, vec2 sizePx) {
 }
 
 void main() {
-  vec2 pxPos = v_localUv * u_boxSizePx;
+  vec2 pxPos = v_localUv * u_quadSizePx - u_quadPaddingPx;
   float dist = computeMaskDistance(pxPos, u_boxSizePx);
   float aa = 1.0;
+
+  if (u_renderPass == 1) {
+    float spread = max(1.0, u_shadowBlurPx * 1.8);
+    float outerNorm = clamp(dist / spread, 0.0, 1.0);
+    float falloff = (1.0 - outerNorm);
+    falloff = falloff * falloff;
+    float interiorGuard = (u_featherPx > 0.25 || u_hasTransparentAlpha == 1)
+      ? smoothstep(-2.0, 2.0, dist)
+      : 1.0;
+    float shadowA = falloff * interiorGuard * u_shadowColor.a * u_shadowOpacity * u_opacity;
+    if (shadowA <= 0.001) discard;
+    outColor = vec4(u_shadowColor.rgb, shadowA);
+    return;
+  }
+
   float maskAlpha = 1.0 - smoothstep(-aa, aa, dist);
+  if (u_featherPx > 0.25) {
+    float tFeather = clamp((-dist) / max(0.001, u_featherPx), 0.0, 1.0);
+    float featherCurve = tFeather * tFeather * (3.0 - 2.0 * tFeather);
+    maskAlpha *= featherCurve;
+  }
   if (maskAlpha <= 0.001) discard;
 
   vec4 texSample = vec4(0.0);
@@ -680,6 +909,34 @@ void main() {
     if (u_alphaMode == 1 && texSample.a > 0.001) {
       // Des-premultiplicar para evitar halos oscuros al componer con SRC_ALPHA
       texSample.rgb = clamp(texSample.rgb / texSample.a, 0.0, 1.0);
+    }
+    if (u_hasTransparentAlpha == 1 && u_alphaMode == 1 && texSample.a > 0.005 && texSample.a < 0.92) {
+      // Descontaminación GPU de borde: reemplaza tinte de pared en píxeles semitransparentes
+      vec2 texelStep = vec2(2.0) / max(vec2(textureSize(u_tex, 0)), vec2(1.0));
+      vec2 uvMin = min(u_srcUvRect.xy, u_srcUvRect.zw);
+      vec2 uvMax = max(u_srcUvRect.xy, u_srcUvRect.zw);
+      vec3 fgAcc = vec3(0.0);
+      float fgW = 0.0;
+      vec2 offsets[4] = vec2[4](
+        vec2(-texelStep.x, 0.0),
+        vec2(texelStep.x, 0.0),
+        vec2(0.0, -texelStep.y),
+        vec2(0.0, texelStep.y)
+      );
+      for (int k = 0; k < 4; k++) {
+        vec4 nb = texture(u_tex, clamp(croppedUv + offsets[k], uvMin, uvMax));
+        if (nb.a > 0.01) {
+          vec3 nbRgb = clamp(nb.rgb / nb.a, 0.0, 1.0);
+          float w = max(0.0, nb.a - texSample.a * 0.5);
+          fgAcc += nbRgb * w;
+          fgW += w;
+        }
+      }
+      if (fgW > 0.001) {
+        vec3 fgRgb = fgAcc / fgW;
+        float deconMix = clamp((0.92 - texSample.a) * 0.78, 0.0, 0.72);
+        texSample.rgb = mix(texSample.rgb, fgRgb, deconMix);
+      }
     }
     if (texSample.a < 0.004) {
       texSample = vec4(0.0);
@@ -750,6 +1007,7 @@ function parseCssColorRgba(colorStr: string): [number, number, number, number] {
 interface CachedWebglTexture {
   texture: WebGLTexture;
   signature: string;
+  alphaMode: 'straight' | 'premultiplied';
   width: number;
   height: number;
 }
@@ -1035,7 +1293,11 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
     gl.bindVertexArray(this.vao);
 
     for (const cmd of plan.layers) {
+      const hasShadow =
+        cmd.geometry.shadowBlurPx > 0.25 && cmd.style.shadowOpacity > 0.005;
+
       if (cmd.unavailableFallbackMode === 'neutral-placeholder') {
+        if (hasShadow) this.drawShadowQuad(cmd);
         this.drawSolidQuad(cmd, [0.06, 0.08, 0.12, 0.88]);
         continue;
       }
@@ -1043,6 +1305,7 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
       let uploadSource: TexImageSourceLike | null = cmd.surface;
       if (!uploadSource && cmd.graphic) {
         if (cmd.graphic.kind === 'color' && cmd.graphic.color) {
+          if (hasShadow) this.drawShadowQuad(cmd);
           this.drawSolidQuad(cmd, parseCssColorRgba(cmd.graphic.color.color));
           continue;
         }
@@ -1056,9 +1319,12 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
 
       if (!uploadSource) continue;
 
-      const tex = this.getOrUploadTexture(cmd.sourceId, uploadSource, cmd.frameSignature);
+      const tex = this.getOrUploadTexture(cmd.sourceId, uploadSource, cmd.frameSignature, cmd.alphaMode);
       if (!tex) continue;
 
+      if (hasShadow) {
+        this.drawShadowQuad(cmd);
+      }
       this.drawTexturedLayerQuad(cmd, tex, uploadSource);
     }
   }
@@ -1066,7 +1332,8 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
   private getOrUploadTexture(
     sourceId: string,
     surface: TexImageSourceLike,
-    signature: string
+    signature: string,
+    alphaMode: 'straight' | 'premultiplied'
   ): WebGLTexture | null {
     const gl = this.gl!;
     let cached = this.sourceTextures.get(sourceId);
@@ -1078,13 +1345,13 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      cached = { texture: tex, signature: '', width: 0, height: 0 };
+      cached = { texture: tex, signature: '', alphaMode, width: 0, height: 0 };
       this.sourceTextures.set(sourceId, cached);
     }
 
-    if (cached.signature !== signature) {
+    if (cached.signature !== signature || cached.alphaMode !== alphaMode) {
       gl.bindTexture(gl.TEXTURE_2D, cached.texture);
-      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, alphaMode === 'premultiplied' ? 1 : 0);
       gl.texImage2D(
         gl.TEXTURE_2D,
         0,
@@ -1094,6 +1361,7 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
         surface as unknown as TexImageSource
       );
       cached.signature = signature;
+      cached.alphaMode = alphaMode;
       this.textureUploadsCount += 1;
     }
 
@@ -1131,6 +1399,29 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
     return new Float32Array([m00, m01, 0, m10, m11, 0, m20, m21, 1]);
   }
 
+  private drawShadowQuad(cmd: LayerRenderCommand): void {
+    const gl = this.gl!;
+    const prog = this.layerProgram!;
+    const pad = Math.ceil(cmd.geometry.shadowBlurPx * 2.0);
+    const paddedGeometry: LayerRenderGeometry = {
+      ...cmd.geometry,
+      layerBox: {
+        x: cmd.geometry.layerBox.x - pad,
+        y: cmd.geometry.layerBox.y - pad,
+        width: cmd.geometry.layerBox.width + pad * 2,
+        height: cmd.geometry.layerBox.height + pad * 2,
+      },
+    };
+    const mat = this.computeClipSpaceMatrix(paddedGeometry, this.width, this.height);
+
+    gl.uniformMatrix3fv(gl.getUniformLocation(prog, 'u_matrix'), false, mat);
+    gl.uniform4f(gl.getUniformLocation(prog, 'u_srcUvRect'), 0, 0, 1, 1);
+    gl.uniform1i(gl.getUniformLocation(prog, 'u_useSolidColor'), 1);
+    gl.uniform4f(gl.getUniformLocation(prog, 'u_solidColor'), 0, 0, 0, 0);
+    this.bindCommonStyleUniforms(cmd, 1, pad, paddedGeometry.layerBox.width, paddedGeometry.layerBox.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
   private drawSolidQuad(cmd: LayerRenderCommand, rgba: [number, number, number, number]): void {
     const gl = this.gl!;
     const prog = this.layerProgram!;
@@ -1140,7 +1431,7 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
     gl.uniform4f(gl.getUniformLocation(prog, 'u_srcUvRect'), 0, 0, 1, 1);
     gl.uniform1i(gl.getUniformLocation(prog, 'u_useSolidColor'), 1);
     gl.uniform4f(gl.getUniformLocation(prog, 'u_solidColor'), rgba[0], rgba[1], rgba[2], rgba[3]);
-    this.bindCommonStyleUniforms(cmd);
+    this.bindCommonStyleUniforms(cmd, 0, 0, cmd.geometry.layerBox.width, cmd.geometry.layerBox.height);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
@@ -1169,14 +1460,21 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
       (sy + sh) / srcH
     );
     gl.uniform1i(gl.getUniformLocation(prog, 'u_useSolidColor'), 0);
-    this.bindCommonStyleUniforms(cmd);
+    this.bindCommonStyleUniforms(cmd, 0, 0, cmd.geometry.layerBox.width, cmd.geometry.layerBox.height);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  private bindCommonStyleUniforms(cmd: LayerRenderCommand): void {
+  private bindCommonStyleUniforms(
+    cmd: LayerRenderCommand,
+    renderPass: 0 | 1,
+    quadPadPx: number,
+    quadWidthPx: number,
+    quadHeightPx: number
+  ): void {
     const gl = this.gl!;
     const prog = this.layerProgram!;
-    const { layerBox, contentLocalRect, borderRadiusPx, borderWidthPx } = cmd.geometry;
+    const { layerBox, contentLocalRect, borderRadiusPx, borderWidthPx, featherPx, shadowBlurPx } =
+      cmd.geometry;
 
     const minU = contentLocalRect.x / Math.max(1, layerBox.width);
     const minV = contentLocalRect.y / Math.max(1, layerBox.height);
@@ -1190,16 +1488,29 @@ export class Webgl2CompositorBackend implements CompositorRenderBackend {
           ? 2
           : cmd.style.maskShape === 'squircle'
             ? 3
-            : 0;
+            : cmd.style.maskShape === 'square'
+              ? 4
+              : cmd.style.maskShape === 'ellipse'
+                ? 5
+                : 0;
     const [br, bg, bb, ba] = parseCssColorRgba(cmd.style.borderColor);
+    const [sr, sg, sb, sa] = parseCssColorRgba(cmd.style.shadowColor);
 
     gl.uniform2f(gl.getUniformLocation(prog, 'u_boxSizePx'), layerBox.width, layerBox.height);
+    gl.uniform2f(gl.getUniformLocation(prog, 'u_quadSizePx'), quadWidthPx, quadHeightPx);
+    gl.uniform2f(gl.getUniformLocation(prog, 'u_quadPaddingPx'), quadPadPx, quadPadPx);
     gl.uniform2f(gl.getUniformLocation(prog, 'u_contentMinUv'), minU, minV);
     gl.uniform2f(gl.getUniformLocation(prog, 'u_contentMaxUv'), maxU, maxV);
     gl.uniform1i(gl.getUniformLocation(prog, 'u_maskShape'), maskInt);
     gl.uniform1f(gl.getUniformLocation(prog, 'u_borderRadiusPx'), borderRadiusPx);
     gl.uniform1f(gl.getUniformLocation(prog, 'u_borderWidthPx'), borderWidthPx);
     gl.uniform4f(gl.getUniformLocation(prog, 'u_borderColor'), br, bg, bb, ba);
+    gl.uniform1f(gl.getUniformLocation(prog, 'u_featherPx'), featherPx);
+    gl.uniform1i(gl.getUniformLocation(prog, 'u_renderPass'), renderPass);
+    gl.uniform4f(gl.getUniformLocation(prog, 'u_shadowColor'), sr, sg, sb, sa);
+    gl.uniform1f(gl.getUniformLocation(prog, 'u_shadowBlurPx'), shadowBlurPx);
+    gl.uniform1f(gl.getUniformLocation(prog, 'u_shadowOpacity'), cmd.style.shadowOpacity);
+    gl.uniform1i(gl.getUniformLocation(prog, 'u_hasTransparentAlpha'), cmd.hasTransparentAlpha ? 1 : 0);
     gl.uniform1f(gl.getUniformLocation(prog, 'u_opacity'), cmd.opacity);
     gl.uniform1i(gl.getUniformLocation(prog, 'u_alphaMode'), cmd.alphaMode === 'premultiplied' ? 1 : 0);
   }
@@ -1265,11 +1576,16 @@ export class Canvas2dCompositorBackend implements CompositorRenderBackend {
   private width: number = INITIAL_PROGRAM_PROFILE.width;
   private height: number = INITIAL_PROGRAM_PROFILE.height;
   private staticGraphicCache = new StaticGraphicRasterCache();
-  // Buffers reutilizables para fade transition sin asignar canvas en cada fotograma
+  // Buffers reutilizables para fade transition y difuminado alfa perimetral sin asignar canvas por fotograma
   private outgoingScratch: HTMLCanvasElement | null = null;
   private outgoingScratchCtx: CanvasRenderingContext2D | null = null;
   private incomingScratch: HTMLCanvasElement | null = null;
   private incomingScratchCtx: CanvasRenderingContext2D | null = null;
+  private layerScratch: HTMLCanvasElement | null = null;
+  private layerScratchCtx: CanvasRenderingContext2D | null = null;
+  private maskScratch: HTMLCanvasElement | null = null;
+  private maskScratchCtx: CanvasRenderingContext2D | null = null;
+  private cachedFeatherMaskKey = '';
 
   initialize(surface: ProgramSurfaceLike, width: number, height: number): boolean {
     this.surface = surface;
@@ -1362,6 +1678,116 @@ export class Canvas2dCompositorBackend implements CompositorRenderBackend {
     }
   }
 
+  private ensureFeatherScratchBuffers(
+    targetW: number,
+    targetH: number,
+    maskShape: LayerMaskShape,
+    borderRadiusPx: number,
+    featherPx: number
+  ): boolean {
+    if (typeof document === 'undefined') return false;
+    const w = Math.max(1, Math.round(targetW));
+    const h = Math.max(1, Math.round(targetH));
+
+    if (!this.layerScratch) {
+      this.layerScratch = document.createElement('canvas');
+      this.layerScratchCtx = this.layerScratch.getContext('2d');
+    }
+    if (!this.maskScratch) {
+      this.maskScratch = document.createElement('canvas');
+      this.maskScratchCtx = this.maskScratch.getContext('2d');
+    }
+    if (!this.layerScratch || !this.layerScratchCtx || !this.maskScratch || !this.maskScratchCtx) {
+      return false;
+    }
+
+    if (this.layerScratch.width !== w || this.layerScratch.height !== h) {
+      this.layerScratch.width = w;
+      this.layerScratch.height = h;
+    }
+    if (this.maskScratch.width !== w || this.maskScratch.height !== h) {
+      this.maskScratch.width = w;
+      this.maskScratch.height = h;
+      this.cachedFeatherMaskKey = '';
+    }
+
+    const maskKey = `${w}x${h}:${maskShape}:${borderRadiusPx.toFixed(1)}:${featherPx.toFixed(1)}`;
+    if (this.cachedFeatherMaskKey !== maskKey) {
+      const imgData = this.maskScratchCtx.createImageData(w, h);
+      const data = imgData.data;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const dist = computeSignedMaskDistancePx(
+            x + 0.5,
+            y + 0.5,
+            w,
+            h,
+            maskShape,
+            borderRadiusPx
+          );
+          const alpha = computeNormalizedFeatherAlpha(dist, featherPx);
+          const idx = (y * w + x) * 4;
+          data[idx] = 255;
+          data[idx + 1] = 255;
+          data[idx + 2] = 255;
+          data[idx + 3] = Math.round(alpha * 255);
+        }
+      }
+      this.maskScratchCtx.putImageData(imgData, 0, 0);
+      this.cachedFeatherMaskKey = maskKey;
+    }
+
+    return true;
+  }
+
+  private drawLayerContentCore(
+    targetCtx: CanvasRenderingContext2D,
+    cmd: LayerRenderCommand
+  ): void {
+    const { geometry } = cmd;
+    const { layerBox, contentLocalRect, sourceRect } = geometry;
+
+    if (cmd.unavailableFallbackMode === 'neutral-placeholder') {
+      targetCtx.fillStyle = 'rgba(14, 18, 28, 0.88)';
+      targetCtx.fillRect(0, 0, layerBox.width, layerBox.height);
+    } else if (cmd.graphic?.kind === 'color' && cmd.graphic.color) {
+      targetCtx.fillStyle = cmd.graphic.color.color;
+      targetCtx.fillRect(0, 0, layerBox.width, layerBox.height);
+    } else if (cmd.graphic) {
+      const renderedGraphic = this.staticGraphicCache.getOrRender(
+        cmd.sourceId,
+        cmd.graphic,
+        layerBox.width,
+        layerBox.height
+      );
+      if (renderedGraphic) {
+        targetCtx.drawImage(renderedGraphic, 0, 0, layerBox.width, layerBox.height);
+      } else if (cmd.graphic.kind === 'gradient' && cmd.graphic.gradient) {
+        const g = cmd.graphic.gradient;
+        const grad = targetCtx.createLinearGradient(0, 0, layerBox.width, layerBox.height);
+        grad.addColorStop(0, g.startColor);
+        grad.addColorStop(1, g.endColor);
+        targetCtx.fillStyle = grad;
+        targetCtx.fillRect(0, 0, layerBox.width, layerBox.height);
+      } else if (cmd.graphic.kind === 'text' && cmd.graphic.text) {
+        targetCtx.fillStyle = cmd.graphic.text.textColor;
+        targetCtx.fillText(cmd.graphic.text.text, 16, layerBox.height * 0.5);
+      }
+    } else if (cmd.surface) {
+      targetCtx.drawImage(
+        cmd.surface as unknown as CanvasImageSource,
+        sourceRect.sx,
+        sourceRect.sy,
+        sourceRect.sw,
+        sourceRect.sh,
+        contentLocalRect.x,
+        contentLocalRect.y,
+        contentLocalRect.width,
+        contentLocalRect.height
+      );
+    }
+  }
+
   private drawPlanToCtx(
     ctx: CanvasRenderingContext2D,
     plan: SceneRenderPlan,
@@ -1384,9 +1810,37 @@ export class Canvas2dCompositorBackend implements CompositorRenderBackend {
   ): void {
     for (const cmd of layers) {
       const { geometry, style } = cmd;
-      const { layerBox, contentLocalRect, sourceRect, anchorPoint } = geometry;
+      const { layerBox, anchorPoint } = geometry;
       const effectiveAlpha = clamp(cmd.opacity * alphaMultiplier, 0, 1);
       if (effectiveAlpha <= 0.001) continue;
+
+      const useOffscreenFeather =
+        typeof document !== 'undefined' &&
+        geometry.featherPx > 0.25 &&
+        this.ensureFeatherScratchBuffers(
+          layerBox.width,
+          layerBox.height,
+          style.maskShape,
+          geometry.borderRadiusPx,
+          geometry.featherPx
+        );
+
+      if (useOffscreenFeather && this.layerScratch && this.layerScratchCtx && this.maskScratch) {
+        const sCtx = this.layerScratchCtx;
+        const sw = this.layerScratch.width;
+        const sh = this.layerScratch.height;
+        sCtx.save();
+        sCtx.globalAlpha = 1;
+        sCtx.globalCompositeOperation = 'source-over';
+        sCtx.clearRect(0, 0, sw, sh);
+        sCtx.save();
+        sCtx.scale(sw / Math.max(1, layerBox.width), sh / Math.max(1, layerBox.height));
+        this.drawLayerContentCore(sCtx, cmd);
+        sCtx.restore();
+        sCtx.globalCompositeOperation = 'destination-in';
+        sCtx.drawImage(this.maskScratch, 0, 0, sw, sh);
+        sCtx.restore();
+      }
 
       ctx.save();
       ctx.globalAlpha = effectiveAlpha;
@@ -1409,12 +1863,36 @@ export class Canvas2dCompositorBackend implements CompositorRenderBackend {
         ctx.scale(geometry.flipH ? -1 : 1, geometry.flipV ? -1 : 1);
       }
 
-      // Sombra exterior dibujada ANTES del recorte
-      if (geometry.shadowBlurPx > 0 && style.shadowOpacity > 0) {
+      // Sombra exterior dibujada ANTES del recorte (respetando shadowOpacity y evitando halo negro con feather/alfa)
+      if (geometry.shadowBlurPx > 0 && style.shadowOpacity > 0.005) {
+        const [sr, sg, sb, sa] = parseCssColorRgba(style.shadowColor);
+        const resolvedShadowCss = `rgba(${Math.round(sr * 255)}, ${Math.round(sg * 255)}, ${Math.round(
+          sb * 255
+        )}, ${(sa * style.shadowOpacity).toFixed(3)})`;
         ctx.save();
-        ctx.shadowColor = style.shadowColor;
+        ctx.shadowColor = resolvedShadowCss;
         ctx.shadowBlur = geometry.shadowBlurPx;
-        ctx.fillStyle = 'rgba(0, 0, 0, 1)';
+        if (useOffscreenFeather && this.layerScratch) {
+          ctx.drawImage(this.layerScratch, 0, 0, layerBox.width, layerBox.height);
+        } else if (geometry.featherPx <= 0.25 && !cmd.hasTransparentAlpha) {
+          ctx.fillStyle = resolvedShadowCss;
+          traceMaskPathOn2dContext(
+            ctx,
+            layerBox.width,
+            layerBox.height,
+            style.maskShape,
+            geometry.borderRadiusPx
+          );
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+
+      if (useOffscreenFeather && this.layerScratch) {
+        ctx.drawImage(this.layerScratch, 0, 0, layerBox.width, layerBox.height);
+      } else {
+        // Recorte con máscara limpia (sin halos)
+        ctx.save();
         traceMaskPathOn2dContext(
           ctx,
           layerBox.width,
@@ -1422,63 +1900,12 @@ export class Canvas2dCompositorBackend implements CompositorRenderBackend {
           style.maskShape,
           geometry.borderRadiusPx
         );
-        ctx.fill();
+        ctx.clip();
+        this.drawLayerContentCore(ctx, cmd);
         ctx.restore();
       }
 
-      // Recorte con máscara limpia (sin halos)
-      ctx.save();
-      traceMaskPathOn2dContext(
-        ctx,
-        layerBox.width,
-        layerBox.height,
-        style.maskShape,
-        geometry.borderRadiusPx
-      );
-      ctx.clip();
-
-      if (cmd.unavailableFallbackMode === 'neutral-placeholder') {
-        ctx.fillStyle = 'rgba(14, 18, 28, 0.88)';
-        ctx.fillRect(0, 0, layerBox.width, layerBox.height);
-      } else if (cmd.graphic?.kind === 'color' && cmd.graphic.color) {
-        ctx.fillStyle = cmd.graphic.color.color;
-        ctx.fillRect(0, 0, layerBox.width, layerBox.height);
-      } else if (cmd.graphic) {
-        const renderedGraphic = this.staticGraphicCache.getOrRender(
-          cmd.sourceId,
-          cmd.graphic,
-          layerBox.width,
-          layerBox.height
-        );
-        if (renderedGraphic) {
-          ctx.drawImage(renderedGraphic, 0, 0, layerBox.width, layerBox.height);
-        } else if (cmd.graphic.kind === 'gradient' && cmd.graphic.gradient) {
-          const g = cmd.graphic.gradient;
-          const grad = ctx.createLinearGradient(0, 0, layerBox.width, layerBox.height);
-          grad.addColorStop(0, g.startColor);
-          grad.addColorStop(1, g.endColor);
-          ctx.fillStyle = grad;
-          ctx.fillRect(0, 0, layerBox.width, layerBox.height);
-        } else if (cmd.graphic.kind === 'text' && cmd.graphic.text) {
-          ctx.fillStyle = cmd.graphic.text.textColor;
-          ctx.fillText(cmd.graphic.text.text, 16, layerBox.height * 0.5);
-        }
-      } else if (cmd.surface) {
-        ctx.drawImage(
-          cmd.surface as unknown as CanvasImageSource,
-          sourceRect.sx,
-          sourceRect.sy,
-          sourceRect.sw,
-          sourceRect.sh,
-          contentLocalRect.x,
-          contentLocalRect.y,
-          contentLocalRect.width,
-          contentLocalRect.height
-        );
-      }
-      ctx.restore();
-
-      // Borde nítido en el contorno exacto de la máscara
+      // Borde nítido en el contorno exacto de la máscara cuando está habilitado
       if (geometry.borderWidthPx > 0) {
         traceMaskPathOn2dContext(
           ctx,
@@ -1514,6 +1941,11 @@ export class Canvas2dCompositorBackend implements CompositorRenderBackend {
     this.outgoingScratchCtx = null;
     this.incomingScratch = null;
     this.incomingScratchCtx = null;
+    this.layerScratch = null;
+    this.layerScratchCtx = null;
+    this.maskScratch = null;
+    this.maskScratchCtx = null;
+    this.cachedFeatherMaskKey = '';
     this.ctx = null;
     this.surface = null;
   }

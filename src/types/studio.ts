@@ -51,7 +51,21 @@ export type AudioOnlySourceKind = 'microphone' | 'system-audio' | 'audio-file';
 export type StudioSourceKind = VisualSourceKind | AudioOnlySourceKind;
 
 export type LayerFitMode = 'contain' | 'cover' | 'stretch';
-export type LayerMaskShape = 'rect' | 'rounded' | 'circle' | 'squircle';
+export type LayerMaskShape =
+  | 'rect'
+  | 'square'
+  | 'rounded'
+  | 'squircle'
+  | 'circle'
+  | 'ellipse';
+export type CameraAspectPreset =
+  | 'sensor'
+  | '16:9'
+  | '4:3'
+  | '9:16'
+  | '3:4'
+  | '1:1'
+  | 'custom';
 export type LayerBlendMode = 'normal' | 'screen' | 'multiply' | 'overlay';
 export type SceneTransitionType = 'cut' | 'fade' | 'slide-left' | 'slide-right' | 'slide-up';
 
@@ -81,6 +95,16 @@ export interface LayerTransform {
   flipV: boolean;
   fitMode: LayerFitMode;
   crop: LayerCrop;
+  /** Proporción deseada del contenedor de capa (independiente del aspecto de ProgramCanvas). */
+  aspectPreset?: CameraAspectPreset;
+  /** Relación ancho/alto personalizada cuando aspectPreset === 'custom' (0.25..4). */
+  customAspectRatio?: number;
+  /** Acercamiento interno del encuadre dentro de la máscara sin deformar la imagen (1..4). */
+  contentZoom?: number;
+  /** Desplazamiento horizontal del encuadre interno (-1..1). */
+  contentOffsetX?: number;
+  /** Desplazamiento vertical del encuadre interno (-1..1). */
+  contentOffsetY?: number;
 }
 
 export interface LayerStyle {
@@ -90,11 +114,15 @@ export interface LayerStyle {
   maskShape: LayerMaskShape;
   /** Radio de esquina en píxeles de referencia (sobre lienzo 1080p). */
   borderRadiusPx: number;
+  /** Activación explícita de contorno/borde de máscara. */
+  borderEnabled?: boolean;
   borderWidthPx: number;
   borderColor: string;
   shadowBlurPx: number;
   shadowOpacity: number;
   shadowColor: string;
+  /** Difuminado suave alfa perimetral hacia el interior en píxeles de referencia 1080p (0..180). */
+  featherPx?: number;
 }
 
 export interface LayerBackgroundSettings

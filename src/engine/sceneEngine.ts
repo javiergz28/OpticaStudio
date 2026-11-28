@@ -63,6 +63,11 @@ export const DEFAULT_LAYER_TRANSFORM: LayerTransform = {
   flipV: false,
   fitMode: 'cover',
   crop: { ...DEFAULT_LAYER_CROP },
+  aspectPreset: 'sensor',
+  customAspectRatio: 16 / 9,
+  contentZoom: 1,
+  contentOffsetX: 0,
+  contentOffsetY: 0,
 };
 
 export const DEFAULT_LAYER_STYLE: LayerStyle = {
@@ -70,11 +75,13 @@ export const DEFAULT_LAYER_STYLE: LayerStyle = {
   blendMode: 'normal',
   maskShape: 'rect',
   borderRadiusPx: 0,
+  borderEnabled: false,
   borderWidthPx: 0,
   borderColor: 'rgba(255, 255, 255, 0.28)',
   shadowBlurPx: 0,
   shadowOpacity: 0,
   shadowColor: 'rgba(0, 0, 0, 0.55)',
+  featherPx: 0,
 };
 
 export const DEFAULT_AUDIO_SOURCE_SETTINGS: AudioSourceSettings = {
@@ -156,6 +163,27 @@ export function clampLayerTransform(
   const rawRot = transform?.rotationDeg ?? base.rotationDeg;
   const safeRot = Number.isFinite(rawRot) ? ((rawRot % 360) + 360) % 360 : 0;
 
+  const aspectPreset = transform?.aspectPreset ?? base.aspectPreset ?? 'sensor';
+  const customAspectRatio = clampNumber(
+    transform?.customAspectRatio ?? base.customAspectRatio ?? 16 / 9,
+    0.25,
+    4,
+    16 / 9
+  );
+  const contentZoom = clampNumber(transform?.contentZoom ?? base.contentZoom ?? 1, 1, 4, 1);
+  const contentOffsetX = clampNumber(
+    transform?.contentOffsetX ?? base.contentOffsetX ?? 0,
+    -1,
+    1,
+    0
+  );
+  const contentOffsetY = clampNumber(
+    transform?.contentOffsetY ?? base.contentOffsetY ?? 0,
+    -1,
+    1,
+    0
+  );
+
   return {
     x: clampNumber(transform?.x ?? base.x, minNormalizedCoord, maxNormalizedCoord, base.x),
     y: clampNumber(transform?.y ?? base.y, minNormalizedCoord, maxNormalizedCoord, base.y),
@@ -178,13 +206,44 @@ export function clampLayerTransform(
     flipV: transform?.flipV ?? base.flipV,
     fitMode: transform?.fitMode ?? base.fitMode,
     crop: clampLayerCrop({ ...base.crop, ...transform?.crop }),
+    aspectPreset,
+    customAspectRatio,
+    contentZoom,
+    contentOffsetX,
+    contentOffsetY,
   };
 }
+
+const VALID_MASK_SHAPES = new Set<LayerStyle['maskShape']>([
+  'rect',
+  'square',
+  'rounded',
+  'squircle',
+  'circle',
+  'ellipse',
+]);
 
 export function clampLayerStyle(
   style?: Partial<LayerStyle>,
   base: LayerStyle = DEFAULT_LAYER_STYLE
 ): LayerStyle {
+  const nextBorderWidthPx = clampNumber(
+    style?.borderWidthPx ?? base.borderWidthPx,
+    0,
+    48,
+    base.borderWidthPx
+  );
+  const resolvedBorderEnabled =
+    typeof style?.borderEnabled === 'boolean'
+      ? style.borderEnabled
+      : typeof base.borderEnabled === 'boolean'
+        ? style?.borderWidthPx !== undefined
+          ? nextBorderWidthPx > 0
+          : base.borderEnabled
+        : nextBorderWidthPx > 0;
+  const candidateMaskShape = style?.maskShape ?? base.maskShape;
+  const maskShape = VALID_MASK_SHAPES.has(candidateMaskShape) ? candidateMaskShape : 'rect';
+
   return {
     opacity: clampNumber(
       style?.opacity ?? base.opacity,
@@ -193,13 +252,20 @@ export function clampLayerStyle(
       base.opacity
     ),
     blendMode: style?.blendMode ?? base.blendMode,
-    maskShape: style?.maskShape ?? base.maskShape,
-    borderRadiusPx: clampNumber(style?.borderRadiusPx ?? base.borderRadiusPx, 0, 512, base.borderRadiusPx),
-    borderWidthPx: clampNumber(style?.borderWidthPx ?? base.borderWidthPx, 0, 48, base.borderWidthPx),
+    maskShape,
+    borderRadiusPx: clampNumber(
+      style?.borderRadiusPx ?? base.borderRadiusPx,
+      0,
+      512,
+      base.borderRadiusPx
+    ),
+    borderEnabled: resolvedBorderEnabled,
+    borderWidthPx: nextBorderWidthPx,
     borderColor: style?.borderColor ?? base.borderColor,
     shadowBlurPx: clampNumber(style?.shadowBlurPx ?? base.shadowBlurPx, 0, 128, base.shadowBlurPx),
     shadowOpacity: clampNumber(style?.shadowOpacity ?? base.shadowOpacity, 0, 1, base.shadowOpacity),
     shadowColor: style?.shadowColor ?? base.shadowColor,
+    featherPx: clampNumber(style?.featherPx ?? base.featherPx ?? 0, 0, 180, 0),
   };
 }
 
@@ -344,6 +410,23 @@ export function removeSourceIfUnused(
       sources: project.sources.filter((s) => s.id !== sourceId),
       updatedAt: Date.now(),
     },
+  };
+}
+
+export function removeSourceSafely(
+  project: StudioProject,
+  sourceId: string
+): {
+  project: StudioProject;
+  removed: boolean;
+  reason?: string;
+  usageCount: number;
+} {
+  const usageCount = getSourceUsageCount(project, sourceId);
+  const res = removeSourceIfUnused(project, sourceId);
+  return {
+    ...res,
+    usageCount,
   };
 }
 
@@ -581,6 +664,114 @@ export function removeLayerFromScene(
   return changed ? { ...project, scenes: nextScenes, updatedAt: now } : project;
 }
 
+export function renameLayerInScene(
+  project: StudioProject,
+  sceneId: string,
+  layerId: string,
+  newName: string
+): StudioProject {
+  const trimmed = newName.trim();
+  if (!trimmed) return project;
+  let changed = false;
+  const now = Date.now();
+  const nextScenes = project.scenes.map((scene) => {
+    if (scene.id !== sceneId) return scene;
+    return {
+      ...scene,
+      layers: scene.layers.map((layer) => {
+        if (layer.id !== layerId || layer.name === trimmed) return layer;
+        changed = true;
+        return { ...layer, name: trimmed };
+      }),
+      updatedAt: now,
+    };
+  });
+  return changed ? { ...project, scenes: nextScenes, updatedAt: now } : project;
+}
+
+export function duplicateLayerInScene(
+  project: StudioProject,
+  sceneId: string,
+  layerId: string,
+  options?: { name?: string }
+): { project: StudioProject; layer: SceneLayer | null } {
+  const targetScene = project.scenes.find((s) => s.id === sceneId);
+  if (!targetScene) return { project, layer: null };
+
+  const ordered = normalizeLayerZIndexes(targetScene.layers);
+  const idx = ordered.findIndex((l) => l.id === layerId);
+  if (idx === -1) return { project, layer: null };
+
+  const orig = ordered[idx];
+  const now = Date.now();
+  const duplicated: SceneLayer = {
+    ...orig,
+    id: createStudioId('layer'),
+    // Comparte exactamente el mismo sourceId sin duplicar la fuente multimedia subyacente
+    sourceId: orig.sourceId,
+    name: options?.name?.trim() || `${orig.name} (Copia)`,
+    locked: false,
+    transform: clampLayerTransform(orig.transform),
+    style: clampLayerStyle(orig.style),
+    processing: orig.processing
+      ? {
+          ...orig.processing,
+          adjustments: orig.processing.adjustments
+            ? { ...orig.processing.adjustments }
+            : undefined,
+          stabilization: orig.processing.stabilization
+            ? { ...orig.processing.stabilization }
+            : undefined,
+          focus: orig.processing.focus ? { ...orig.processing.focus } : undefined,
+          background: orig.processing.background
+            ? { ...orig.processing.background }
+            : undefined,
+        }
+      : undefined,
+  };
+
+  const inserted = [...ordered];
+  inserted.splice(idx + 1, 0, duplicated);
+  const normalizedLayers = inserted.map((l, zIdx) => ({ ...l, zIndex: zIdx }));
+  const finalLayer = normalizedLayers.find((l) => l.id === duplicated.id) ?? duplicated;
+
+  return {
+    layer: finalLayer,
+    project: {
+      ...project,
+      scenes: project.scenes.map((scene) =>
+        scene.id === sceneId
+          ? {
+              ...scene,
+              layers: normalizedLayers,
+              updatedAt: now,
+            }
+          : scene
+      ),
+      updatedAt: now,
+    },
+  };
+}
+
+export function resetLayerTransformInScene(
+  project: StudioProject,
+  sceneId: string,
+  layerId: string
+): StudioProject {
+  return updateLayerTransform(project, sceneId, layerId, DEFAULT_LAYER_TRANSFORM);
+}
+
+export function resetLayerStyleInScene(
+  project: StudioProject,
+  sceneId: string,
+  layerId: string
+): StudioProject {
+  const scene = project.scenes.find((s) => s.id === sceneId);
+  const layer = scene?.layers.find((l) => l.id === layerId);
+  if (!scene || !layer || layer.locked) return project;
+  return updateLayerStyle(project, sceneId, layerId, DEFAULT_LAYER_STYLE);
+}
+
 export function reorderSceneLayers(
   project: StudioProject,
   sceneId: string,
@@ -712,6 +903,33 @@ export function updateLayerTransform(
         return {
           ...layer,
           transform: clampLayerTransform(transformPatch, layer.transform),
+        };
+      }),
+      updatedAt: now,
+    };
+  });
+  return changed ? { ...project, scenes: nextScenes, updatedAt: now } : project;
+}
+
+export function updateMultipleLayerTransforms(
+  project: StudioProject,
+  sceneId: string,
+  patchesByLayerId: Map<string, Partial<LayerTransform>>
+): StudioProject {
+  if (patchesByLayerId.size === 0) return project;
+  let changed = false;
+  const now = Date.now();
+  const nextScenes = project.scenes.map((scene) => {
+    if (scene.id !== sceneId) return scene;
+    return {
+      ...scene,
+      layers: scene.layers.map((layer) => {
+        const patch = patchesByLayerId.get(layer.id);
+        if (!patch || layer.locked) return layer;
+        changed = true;
+        return {
+          ...layer,
+          transform: clampLayerTransform(patch, layer.transform),
         };
       }),
       updatedAt: now,

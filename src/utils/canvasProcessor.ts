@@ -11,7 +11,8 @@ import {
   type StabilizationSettings,
   type VisualEffectId,
 } from '../types/camera';
-import { segmentSubjectWithAi } from './aiVision';
+import { segmentSubjectWithAi, setAiSegmentationSource, reportAiSegmentationFailure } from './aiVision';
+import { applySubjectAlpha } from './subjectMatte';
 import { applyWebglColorFilter, applyWebglVisualEffect } from './webglEffects';
 
 export interface RenderPipelineOptions {
@@ -37,6 +38,8 @@ export interface RenderPipelineOptions {
   pipCorner?: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left';
   pipSizeRatio?: number; // e.g. 0.24
   pipCircular?: boolean;
+  /** True only for the isolated camera surface managed by Studio. */
+  cameraOnlyAlpha?: boolean;
 }
 
 // Reusable offscreen buffers to prevent per-frame allocation
@@ -977,15 +980,23 @@ export function renderCameraFrame(
     panX,
     panY,
     filterId,
-    effectId,
+    effectId: requestedEffectId,
     adjustments,
     stabilization,
     background,
     branding,
   } = options;
 
+  const transparentRequested = background.mode === 'transparent' && options.cameraOnlyAlpha === true && !screenSource && !dualCamSource;
+  const geometricEffects = ['kaleidoscope-2', 'kaleidoscope-4', 'pop-art', 'pixelate', 'cyberpunk-glitch', 'vhs-retro'];
+  const effectId = transparentRequested && geometricEffects.includes(requestedEffectId) ? 'none' : requestedEffectId;
+  const streamIdentity = 'srcObject' in primarySource && primarySource.srcObject && typeof primarySource.srcObject === 'object'
+    ? primarySource.srcObject : primarySource;
+  setAiSegmentationSource(streamIdentity, [primaryW, primaryH, width, height, mirror, flipVertical, rotation, fitMode, zoom, panX, panY].join(':'));
+  let transparentMask: HTMLCanvasElement | null = null;
   const { workCanvas: wC, workCtx: wCtx, rawCanvas: rC, rawCtx: rCtx } = ensureBuffers(width, height);
-  if (!wC || !wCtx || !rC || !rCtx) return;
+  if (!wC || !wCtx || !rC || !rCtx) return false;
+  dstCtx.clearRect(0, 0, width, height);
 
   // Apply 90/180/270 source rotation before stabilization & aspect-ratio fitting
   let effectiveSource: HTMLVideoElement | HTMLCanvasElement = primarySource;
@@ -1051,7 +1062,10 @@ export function renderCameraFrame(
   applyFullColorGrade(rC, wCtx, filterId, adjustments, width, height);
 
   // 2b. Real-time Foreground Segmentation & Background Replacement
-  if (background.mode !== 'none' || requestCalibrateNextFrame) {
+  if (transparentRequested) {
+    requestCalibrateNextFrame = false;
+    transparentMask = segmentSubjectWithAi(rC, background.sensitivity, background.edgeSoftness, true);
+  } else if (background.mode !== 'transparent' && (background.mode !== 'none' || requestCalibrateNextFrame)) {
     if (background.mode === 'none' && requestCalibrateNextFrame) {
       // Allow pre-calibrating empty background even before turning mode on
       applyBackgroundSegmentation(rC, wCtx, width, height, { ...background, mode: 'blur' }, onBackgroundCalibrated);
@@ -1289,6 +1303,21 @@ export function renderCameraFrame(
     }
   }
 
+  // Apply the real matte LAST, after opaque GPU/2D color and effects.
+  // The isolated camera surface is cleared every frame; no shared-screen pixels are touched.
+  if (transparentRequested) {
+    if (!transparentMask) return false;
+    try {
+      applySubjectAlpha(dstCtx, transparentMask, width, height, background.edgeSoftness);
+      return true;
+    } catch (error) {
+      reportAiSegmentationFailure(error);
+      dstCtx.clearRect(0, 0, width, height);
+      dstCtx.drawImage(wC, 0, 0, width, height);
+      return false;
+    }
+  }
+
   // 4. Baked overlays (Cinema letterbox, Timestamp, Lower Third)
   if (branding.cinemaFrame) {
     const barH = Math.round(height * 0.11);
@@ -1347,6 +1376,7 @@ export function renderCameraFrame(
     }
     dstCtx.restore();
   }
+  return false;
 }
 
 export interface HistogramData {

@@ -47,16 +47,22 @@ export const GlassDisclosure: React.FC<GlassDisclosureProps> = ({
 
   return (
     <section className={`py-3.5 border-b border-[var(--border-hairline)] last:border-b-0 ${className}`}>
-      <button
-        type="button"
-        aria-expanded={isOpen}
-        aria-controls={contentId}
-        onClick={handleToggle}
-        className="glass-focus-ring w-full flex items-center justify-between gap-2 py-1 text-left rounded-lg cursor-pointer group"
-      >
-        <div className="flex items-center gap-2 min-w-0">
+      <div className="w-full flex items-center justify-between gap-2 py-1">
+        <button
+          type="button"
+          aria-expanded={isOpen}
+          aria-controls={contentId}
+          onClick={handleToggle}
+          className="glass-focus-ring flex-1 min-w-0 flex items-center gap-2 text-left rounded-lg cursor-pointer group py-0.5"
+        >
+          <ChevronRight
+            aria-hidden="true"
+            className={`w-3.5 h-3.5 shrink-0 text-[var(--text-tertiary)] group-hover:text-[var(--text-primary)] transition-transform duration-150 ${
+              isOpen ? 'rotate-90' : ''
+            }`}
+          />
           {icon && <span className="shrink-0 opacity-90">{icon}</span>}
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <div className="text-[13px] font-semibold tracking-tight text-[var(--text-primary)] truncate">
               {title}
             </div>
@@ -66,17 +72,9 @@ export const GlassDisclosure: React.FC<GlassDisclosureProps> = ({
               </div>
             )}
           </div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {badge}
-          <ChevronRight
-            aria-hidden="true"
-            className={`w-3.5 h-3.5 text-[var(--text-tertiary)] group-hover:text-[var(--text-primary)] transition-transform duration-150 ${
-              isOpen ? 'rotate-90' : ''
-            }`}
-          />
-        </div>
-      </button>
+        </button>
+        {badge && <div className="flex items-center gap-2 shrink-0">{badge}</div>}
+      </div>
 
       <AnimatePresence initial={false}>
         {isOpen && (

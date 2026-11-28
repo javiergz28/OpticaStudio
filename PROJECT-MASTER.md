@@ -1,8 +1,8 @@
 # PROJECT MASTER — ÓPTICA STUDIO PRO
 
-> **Estado actual:** `CP-P01-E4` captura aprobada por el usuario; validación física restante abierta. Próximo desarrollo: `CP-P02-A` tras sincronización.
+> **Estado actual:** R2: usuario confirma mejora visual del recorte, pero rechaza fluidez. CP-P02 completo y aprobado físicamente por el usuario en R3; sincronización con AI Studio pendiente antes de CP-P03-A. CP-P03-A no iniciado.
 > **Repositorio maestro:** `https://github.com/javiergz28/OpticaStudio`
-> **Commit base de referencia:** `ed2c6c96573d457e3ca0b0115c0674b89531ffbc`
+> **Commit base consolidado:** `28f38e640ebc8fa1c04ca968268dbbc2487d8702`
 > **Plataforma prioritaria:** macOS Apple Silicon (ARM64) vía Electron + compatibilidad web operativa en Google AI Studio desde el mismo código fuente.
 
 ---
@@ -551,16 +551,224 @@ Por decisión del usuario, la aplicación de producción no debe utilizar cámar
 - Conservar las correcciones locales: barra superior, identidad nativa, permisos Electron, selector de captura, cambio a escena con pantalla visible después de autorización, botón Compartir pantalla en el visor, retirada de cámara sintética y migración de nombres existentes. No reemplazar estos archivos por versiones antiguas de AI Studio.
 - Mantener 74 pruebas actuales como mínimo, lint y desktop:build; validar hardware por separado.
 
-### CP-P02-A — Editor visual (siguiente)
+### CP-P02-A — Editor visual (implementado)
 
-Seleccionar, arrastrar y redimensionar la capa de cámara en el visor, con coordenadas normalizadas, guías, ajuste a bordes, límites de composición, teclado, bloqueo y persistencia por escena. Superposición de cámara con ancho máximo 50% y superficie máxima 50% cuando hay pantalla compartida; no deformar cámara ni contenido. No cambiar ProgramCanvas, reiniciar fuentes ni imprimir controles de edición en la salida. Inspector contextual discreto, sin paneles redundantes.
+- **Motor geométrico y restricciones (`src/engine/layerEditor.ts`):**
+  - Selección por hit-test (`hitTestSceneLayerAtPoint`), arrastre normalizado (`computeLayerDragTransform`), redimensionado desde las 4 esquinas conservando relación de aspecto (`computeLayerCornerResizeTransform`), ajuste fino con teclado (`Arrow*` 0.01, `Shift+Arrow*` 0.04, `Alt+Arrow*` 0.002, `Escape` para deseleccionar), guías y ajuste magnético a bordes, márgenes seguros (`0.03`) y ejes centrales (`0.5`, anulable con `Alt`), bloqueo por capa (`locked`) y colocación rápida / proporción exacta del sensor.
+  - Cuando existe una fuente compartida visible (`window` o `screen`) en la escena, la superposición de cámara se limita a un máximo del **50 % de ancho** y **50 % de área**, sin deformar la cámara ni el contenido compartido; las escenas solo cámara permiten hasta el **100 %**.
+- **Coordinador y persistencia por escena (`src/engine/studioCoordinator.ts`, `src/hooks/useStudioEngine.ts`):**
+  - Añadidos `getOutputDimensions`, `updateSceneLayerTransform` y `setSceneLayerLocked` con persistencia independiente por escena en `optica_studio_projects_db` (`studioStorage`) y actualización inmediata del `ProgramCompositor`, sin reiniciar fuentes de `SourceManager` ni alterar las dimensiones de `ProgramCanvas`.
+- **Interfaz visual y accesibilidad (`src/components/CameraViewport.tsx`, `src/components/LeftStudioPanel.tsx`, `src/components/SidebarControls.tsx`, `src/App.tsx`):**
+  - Superposición interactiva exclusiva de DOM sobre el visor (borde de selección, indicador de tamaño/bloqueo, 4 manejadores de esquina y líneas guía de alineación) completamente excluida de la salida de `ProgramCanvas` (foto, MP4 y PiP).
+  - Menú contextual de clic derecho (`Editar/Deseleccionar capa de cámara`, `Bloquear/Desbloquear`), selección/bloqueo directo desde la pestaña `Capas` de `LeftStudioPanel`, e inspector discreto `Capa de Cámara en Escena` en `SidebarControls` (`Óptica`).
+- **Verificación automatizada (`CP-P02-A`):**
+  - `npm test`: **83/83 pruebas superadas** (74 previas + 7 pruebas unitarias en `tests/layerEditor.test.ts` + 2 pruebas de integración en `tests/studioIntegration.test.ts`, utilizando adaptadores simulados en Node.js).
+  - `npm run lint` (`tsc --noEmit && tsc -p electron/tsconfig.json --noEmit`): **0 errores**.
+  - `npm run desktop:build`: compilación Web + Electron completada sin errores (`package-lock.json`, `electron/main.ts`, `electron/preload.ts` y `.github/workflows/*` sin modificar).
+  - *Pendiente de validación física en macOS ARM64:* fluidez de arrastre/redimensionado a 60 fps con cámara FaceTime HD/Continuity y ventana compartida real, y comprobación de exportación limpia (PNG, MP4 y PiP flotante) sin artefactos de interfaz.
 
-### CP-P02-B — Estilo y borde alfa
+### CP-P02-B — Editor avanzado, estilos de cámara y composición profesional (implementado)
 
-Rectángulo, cuadrado, redondeado, squircle y círculo, encuadre interno y opción de borde invisible. Añadir feather (difuminado alfa real del perímetro) ajustable, cero por defecto para compatibilidad, con caída suave de opacidad hacia afuera y centro intacto, sin desenfocar toda la cámara ni la pantalla subyacente. Separar opacidad global y feather. Si feather está activo, permitir borde decorativo desactivado (preferido). Aplicar en máscara del compositor, no en CSS del visor. WebGL2: distancia firmada en coordenadas de píxel, smoothstep y alpha correcta, sin halo negro. Canvas2D: máscara alfa en superficie auxiliar reutilizable; no simular mediante sombra o blur del fondo. Normalizar respecto al tamaño de la capa para conservar apariencia entre resoluciones. Garantizar equivalencia visible y exportación limpia en foto, grabación y PiP. Probar 16:9, 9:16, 1:1 y límites de tamaño.
+- **Corrección de errores de ejecución en vista previa (`src/components/glass/GlassContainers.tsx`):**
+  - Corregido el anidamiento inválido `<button>` dentro de `<button>` en `GlassDisclosure` (el slot `badge` ahora es un contenedor hermano fuera del botón principal de acordeón, manteniendo el comportamiento visual y evitando errores de hidratación/DOM en React 19).
+- **Eliminación de la restricción del 50 % (`src/engine/layerEditor.ts`, `src/engine/studioCoordinator.ts`, `src/components/SidebarControls.tsx`):**
+  - La superposición de cámara puede escalarse libremente desde un pequeño recuadro (`8 %`) hasta el **100 %** de ancho y superficie incluso cuando hay una ventana o pantalla compartida visible (`OVERLAY_MAX_WIDTH_RATIO = 1`, `OVERLAY_MAX_AREA_RATIO = 1`, sin topes ni advertencias del 50 %).
+- **Proporción independiente de cámara y encuadre sin distorsión (`src/types/studio.ts`, `src/engine/layerEditor.ts`, `src/engine/programCompositor.ts`):**
+  - Añadido selector de proporción propia para la capa de cámara (`Sensor`, `16:9`, `4:3`, `9:16`, `3:4`, `1:1`, `Personalizada`) totalmente independiente del formato de salida de `ProgramCanvas` y diferenciada de la rotación en grados (`rotationDeg`).
+  - Encuadre interno sin estiramientos (`cover` / `contain`), con `contentZoom` (`1×–4×`) y desplazamiento `contentOffsetX/Y` (`-100 %` a `+100 %`) aplicados directamente en `computeLayerRenderGeometry` y reflejados de forma equivalente en WebGL2 y Canvas2D.
+- **Formas, estilos en vivo, sombra real y difuminado alfa perimetral sin halos (`src/engine/programCompositor.ts`, `src/engine/sceneEngine.ts`, `src/utils/studioStorage.ts`, `src/components/CameraViewport.tsx`):**
+  - Soportadas las **6 formas** (`rect`, `square`, `rounded`, `squircle`, `circle`, `ellipse`), radio de esquina ajustable, interruptor real `Borde visible` (`borderEnabled` desacoplado de `borderWidthPx`), opacidad global independiente y sombra difuminada real tanto en **WebGL2** (pasada analítica `u_renderPass = 1` sin halos interiores) como en **Canvas2D** (superficies auxiliares reutilizables `layerScratch`/`maskScratch` cacheadas).
+  - Añadido `featherPx` (`0` por defecto): atenuación suave hermítica hacia el interior del perímetro en **alfa recto** (`alphaMode: 'straight'`), compatible con las 6 formas, funcional con el borde desactivado, independiente de la opacidad global y preparado para componerse limpiamente junto a transparencia de sujeto (`hasTransparentSubject`) en `CP-P02-C`.
+  - Todos los cambios se aplican en caliente desde `StudioCoordinator.updateSceneLayerStyle` / `updateSceneLayerTransform` / `applyAdaptableLayout` con bloqueo (`locked`) respetado, persistencia por escena en `studioStorage` y **0 reinicios de pistas** ni recreación de `ProgramCanvas`.
+- **Inspector de cámara Liquid Glass y composición adaptable (`src/components/SidebarControls.tsx`, `src/App.tsx`):**
+  - Reorganizado el inspector contextual en 6 secciones limpias con jerarquía ligera: **Transformación** (con botones rápidos de **Composición adaptable**: esquinas, centro, `PiP`, `Div. Horiz.`, `Div. Vert.` y `100 %`), **Proporción**, **Encuadre**, **Forma**, **Apariencia** e **Integración alfa**.
+- **Notas para manual de usuario (branding NextGen V3.1):**
+  - Documentar con instrucciones breves: diferencia entre *Proporción de cámara* y *Rotación*; ajuste libre hasta *100 %* incluso con pantalla compartida; recorte interno sin deformación (*Encuadre*); elección de las 6 formas con borde opcional; sombra difuminada y *Difuminado perimetral* para suavizar la integración sin halos; y diseños rápidos de *Composición adaptable*.
+- **Verificación automatizada (`CP-P02-B`):**
+  - `npm test`: **89/89 pruebas superadas** (83 previas actualizadas al escalado libre del 100 % + 6 nuevas pruebas en `layerEditor.test.ts`, `programCompositor.test.ts` y `studioIntegration.test.ts` usando adaptadores simulados en Node.js).
+  - `npm run lint` (`tsc --noEmit && tsc -p electron/tsconfig.json --noEmit`): **0 errores**.
+  - `npm run build`, `npm run desktop:build` y `compile_applet` / `lint_applet`: compilación correcta sin tocar `package-lock.json`, `electron/main.ts`, `electron/preload.ts`, `electron-builder.yml` ni `.github/workflows/*`.
+  - *Pendiente de validación física en macOS ARM64:* comprobación visual y de rendimiento GPU real sobre WebGL2/ANGLE/Metal y Canvas2D en Electron Desktop (sombras, `squircle`/`ellipse`/`circle`, `featherPx` sobre pantalla compartida real, proporción 16:9 / 9:16 / 1:1 y exportación limpia en PNG, grabación MP4/WebM y PiP flotante) antes de aprobar e iniciar `CP-P02-C`.
 
-### CP-P02-C — Presentador sin fondo y composición adaptable
+### CP-P02-C1 — Editor universal de capas y control completo de pantalla compartida (implementado)
 
-Recorte de sujeto con transparencia real, tratamiento de cabello/manos y estabilidad temporal; no aplicar filtros a pantalla compartida. Ajuste libre y modos PiP/pantalla dividida conservando proporciones. Si segmentación no funciona, mostrar error y ofrecer volver a cámara real sin recorte; nunca simular un sujeto. Manual intuitivo, conciso, editorial NextGen V3.1.
+- **Scope estricto de fase 1 (`CP-P02-C1`):** Generaliza el editor visual y el inspector para **cualquier capa visual compatible** (`camera`, `window`, `screen`, `image`, `video-file`, `color`, `gradient`, `text`) conservando intacto el aislamiento frente a fuentes de solo audio (`microphone`, `system-audio`, `audio-file`), sin implementar todavía el gestor de orden `zIndex`/visibilidad/plantillas de composición (`CP-P02-C2`) ni la segmentación/recorte inteligente de sujeto (`CP-P02-C3`).
+- **Generalización geométrica y selección por `zIndex` (`src/engine/layerEditor.ts`, `src/engine/studioCoordinator.ts`, `src/hooks/useStudioEngine.ts`):**
+  - Añadidas utilidades universales (`AUDIO_ONLY_SOURCE_KINDS`, `isVisualSourceEditable`, `isVisualKindEditable`, `findPrimaryVisualLayer`, `resolveTargetEditableLayer`, `clampVisualLayerTransformForScene`, `resolveLayerSourceAspectRatio`, `computeLayerAspectTransform`, `computeProportionalLayerTransform`, `computeScaledLayerWidthTransform`) manteniendo alias compatibles para código previo.
+  - `hitTestSceneLayerAtPoint` ignora capas solo audio y evalúa visibilidad en **orden descendente real de `zIndex`**.
+  - `updateSceneLayerTransform` valida en el coordinador que no se apliquen transformaciones geométricas a fuentes solo audio, respeta el bloqueo (`locked`) y aplica `clampVisualLayerTransformForScene` a cualquier capa visual.
+  - `applyAdaptableLayout` admite `selectedLayerId`, `intrinsicWidth` e `intrinsicHeight` resueltos en caliente desde `sourceManager` para ubicar y escalar la capa seleccionada (`corner-*`, `center`, `camera-full`) conservando el comportamiento de `pip-overlay` y `split-*`.
+- **Visor directo, atajos, panel de capas y selector contextual (`src/components/CameraViewport.tsx`, `src/components/LeftStudioPanel.tsx`, `src/components/SidebarControls.tsx`, `src/App.tsx`):**
+  - El clic directo y los menús contextuales del visor (`CameraViewport`) operan sobre cualquier capa visual editable visible en orden descendente de `zIndex`; las capas al `100 %` conservan manejadores accesibles en las 4 esquinas interiores y etiqueta con nombre y tamaño real.
+  - Los atajos de teclado (`Arrow*`, `Shift+Arrow*`, `Alt+Arrow*`, `Escape`) mueven cualquier capa visual seleccionada desbloqueada.
+  - `LeftStudioPanel` → pestaña `Capas` permite seleccionar y bloquear/desbloquear **cualquier capa visual**, incluidas capas inferiores ocultas u ocluidas por otras superiores (p. ej. una ventana/pantalla bajo una cámara), mientras las fuentes de solo audio figuran honestamente como `Audio · sin geometría`.
+  - `SidebarControls` añade una franja contextual (`Capa en edición`) con selector entre capas visuales de la escena, estado/resolución nativa viva (o CTA directo `Compartir ventana o pantalla` cuando no hay captura activa), aclaración explícita de que filtros/enfoque/IA de cámara no se aplican a `window`/`screen`, separación clara de `Cámara física` y `Zoom Digital del visor` (`Ampliación digital del visor`), y las 6 secciones contextuales (**Transformación**, **Proporción** con `Original` / `Sensor`, **Encuadre** con zoom interno de contenido + desplazamiento + **recorte independiente por los 4 bordes `crop` (`0–49 %`)**, **Forma**, **Apariencia** e **Integración alfa**) válidas para cualquier capa visual.
+- **Control completo de pantalla/ventana compartida y adaptación dinámica (`src/engine/programCompositor.ts`):**
+  - `buildSceneRenderPlan` lee en tiempo real `video.videoWidth` / `video.videoHeight` en cada fotograma, de modo que si el usuario redimensiona o cambia de orientación la ventana compartida en vivo el compositor adapta encuadre, `crop`, proporción y `diagnostics[].intrinsicWidth/Height` sin reiniciar pistas ni recrear `ProgramCanvas`, manteniendo aislamiento estricto de `setProcessedCameraSurface` (nunca filtra ni altera capas `window`/`screen`).
+- **Notas para manual de usuario (branding NextGen V3.1):**
+  - Explicar con pasos breves y capturas anotadas la diferencia entre: **Ampliación digital del visor** (zoom óptico/digital dentro del sensor de cámara), **Tamaño libre de capa** (escala de la caja en la escena hasta `100 %`), **Zoom interno y encuadre de contenido** (acercamiento dentro de la propia ventana o imagen sin deformarla) y **Recorte por bordes** (ocultar barras de título, pestañas o márgenes con superior/inferior/izquierdo/derecho); e indicar cómo seleccionar una ventana o fondo cubierto desde `Capas`.
+- **Verificación automatizada (`CP-P02-C1`):**
+  - `npm test` (`tsx --test tests/*.test.ts`): **95/95 pruebas superadas** (`89` previas + `6` nuevas pruebas específicas de `CP-P02-C1` en `tests/layerEditor.test.ts`, `tests/programCompositor.test.ts` y `tests/studioIntegration.test.ts`, ejecutadas en Node.js con adaptadores simulados).
+  - `npm run lint` (`tsc --noEmit && tsc -p electron/tsconfig.json --noEmit`): **0 errores**.
+  - `npm run desktop:build` (`icons:build` + `vite build` + `build-electron.mjs`) y `compile_applet` / `lint_applet`: compilación correcta sin modificar `package-lock.json`, `electron/main.ts`, `electron/preload.ts`, `electron-builder.yml` ni `.github/workflows/*`.
+  - *Pendiente de validación física en macOS ARM64:* comprobación real en Electron Desktop Apple Silicon con `desktopCapturer` compartiendo una ventana viva mientras se redimensiona, probando `crop` en los 4 bordes, `cover`/`contain`, `squircle`/`circle`, sombra, `featherPx` y captura/grabación limpia desde `ProgramCanvas` bajo WebGL2/ANGLE/Metal y Canvas2D sin pérdida de fluidez ni regresiones en 4K/PiP.
 
-Ejecutar inicialmente solo CP-P02-A después de comprobar la base sincronizada. No comenzar B/C sin aprobación.
+### CP-P02-C2 — Administración profesional de capas y composición multicapa (implementado)
+
+- **Scope estricto de fase 2 (`CP-P02-C2`):** Implementa el administrador visual profesional de capas, adición/gestión segura de fuentes reales, composición multicapa avanzada y un historial acotado `Deshacer / Rehacer`, dejando **`CP-P02-C3`** (segmentación de fondo e integración alfa del presentador) pendiente para la siguiente etapa.
+- **Panel `Capas` profesional y operaciones completas (`src/components/LeftStudioPanel.tsx`, `src/engine/sceneEngine.ts`, `src/engine/studioCoordinator.ts`, `src/hooks/useStudioEngine.ts`):**
+  - Lista ordenada jerárquicamente de arriba (primer plano) hacia abajo (fondo) según `zIndex` descendente, eliminando etiquetas técnicas innecesarias (`z:{n}`).
+  - Cada fila muestra icono por tipo de fuente, nombre editable inline (`doble clic` o menú `Renombrar`, `Enter`/desenfoque guarda, `Escape` cancela), indicador de selección visual, botón de visibilidad (`Eye`/`EyeOff`), bloqueo/desbloqueo (`Lock`/`Unlock`), estado real de conexión (`En vivo`, `Pausada`, `Desconectada`, `Error`, `Autorizar`, `Gráfica`) y agarre para arrastre vertical con línea indicadora de destino (`arriba`/`abajo`) + atajos de teclado (`⌥↑` / `⌥↓`).
+  - Menú contextual completo (`GlassContextMenu` por clic derecho o botón `...`, y acciones rápidas en `CameraViewport`): **Renombrar**, **Ocultar / Mostrar**, **Bloquear / Desbloquear**, **Subir un nivel**, **Bajar un nivel**, **Traer al frente**, **Enviar al fondo**, **Duplicar capa** (comparte `sourceId` sin duplicar el `StudioSource` subyacente ni sus pistas), **Restablecer transformación**, **Restablecer apariencia** y **Eliminar de la escena** con confirmación (`GlassDialog`) y aviso reversible (`Deshacer`).
+  - Separación estricta entre quitar una capa de una escena (`removeSceneLayer`) y eliminar una fuente huérfana del proyecto (`removeProjectSourceSafely`, bloqueado si la fuente sigue en uso en alguna escena o activa durante grabación).
+- **Adición de fuentes reales y almacén binario local (`src/utils/studioAssetStore.ts`, `src/engine/sourceManager.ts`, `src/components/LeftStudioPanel.tsx`):**
+  - Selector `+ Añadir` con soporte honesto y real para: **Cámara** (`enumerateDevices` real), **Ventana** (`getDisplayMedia`), **Pantalla** (`getDisplayMedia`), **Imagen**, **Vídeo** y **Audio local** (archivos reales persistidos como `Blob` en IndexedDB `optica_studio_assets_db` mediante referencia `optica-asset:*` con fallback en memoria y limpieza automática al borrar fuentes sin uso), **Texto**, **Color sólido**, **Degradado**, **Micrófono** (`enumerateDevices` real) y **Audio del sistema** (aviso transparente del comportamiento loopback en macOS sin inventar pistas falsas ni mezcladores ficticios).
+  - Cancelar el selector de ventana/pantalla nunca deja fuentes ni capas rotas en la escena ni en el proyecto.
+- **Composición multicapa avanzada (`src/engine/layerEditor.ts`, `src/components/SidebarControls.tsx`, `src/components/LeftStudioPanel.tsx`):**
+  - Añadidas composiciones profesionales **Pantalla + cámara flotante** (`screen-main-cam-pip`), **Cámara + ventana flotante** (`cam-main-window-pip`), **Lado a lado** (`split-horizontal`), **Vertical apilada** (`split-vertical`), **Dos ventanas** (`dual-windows-side-by-side`), **Cuadrícula múltiple** (`grid-multi`) y **Libre** (`freeform`, que conserva posiciones manuales sin sobrescribir), con selección opcional de capas participantes (`participatingLayerIds`) y respeto absoluto de capas bloqueadas.
+- **Continuidad audiovisual e historial acotado (`src/engine/compositionHistory.ts`, `src/engine/studioCoordinator.ts`, `src/App.tsx`):**
+  - Reordenar, renombrar, ocultar/mostrar, duplicar, restablecer o estilizar capas **nunca reinicia pistas activas ni recrea `ProgramCanvas`**. Ocultar una capa preserva su transformación, estilo y procesamiento, omite su renderizado en `ProgramCompositor` y mantiene vivas las pistas; volver a mostrarla la reanuda sin abrir `getDisplayMedia` automáticamente.
+  - Historial acotado `CompositionHistory` (máximo 40 estados serializables, sin almacenar recursos multimedia vivos) con soporte de **`Cmd+Z` / `Ctrl+Z`** (`Deshacer`), **`Cmd+Shift+Z` / `Ctrl+Shift+Z`** (`Rehacer`) y botones en `Capas`, agrupación automática de gestos continuos (arrastre/redimensionado en visor y deslizadores del inspector), persistencia inmediata de cambios restaurados y **cero llamadas a hardware** (`getUserMedia`/`getDisplayMedia`) al deshacer o rehacer.
+- **Notas para manual de usuario (branding NextGen V3.1):**
+  - Explicar con capturas anotadas: cómo funciona el orden de capas (las superiores tapan a las inferiores), reordenamiento por arrastre / `⌥↑` / `⌥↓`, diferencia entre **Ocultar capa** (mantiene ajustes y cámara viva), **Quitar de la escena** vs **Eliminar del proyecto**, añadir fuentes reales (`Ventana`, `Pantalla`, `Imagen`, `Vídeo`, `Texto`, `Fondos`) y uso de **Composiciones multicapa** + **`⌘Z` / `⇧⌘Z`** para experimentar sin miedo.
+- **Verificación automatizada (`CP-P02-C2`):**
+  - `npm test` (`tsx --test tests/*.test.ts`): **102/102 pruebas superadas** (`95` previas + `7` nuevas pruebas unitarias y de integración de `CP-P02-C2` en `tests/studioModel.test.ts`, `tests/layerEditor.test.ts` y `tests/studioIntegration.test.ts`, usando adaptadores simulados en Node.js).
+  - `npm run lint` (`tsc --noEmit && tsc -p electron/tsconfig.json --noEmit`): **0 errores**.
+  - `npm run desktop:build` (`icons:build` + `vite build` + `build-electron.mjs`) y `compile_applet` / `lint_applet`: compilación correcta sin modificar `package-lock.json`, `electron/main.ts`, `electron/preload.ts`, `electron-builder.yml` ni `.github/workflows/*`.
+  - *Pendiente de validación física en macOS ARM64:* comprobación real en Electron Desktop Apple Silicon de arrastrar/reordenar múltiples fuentes reales en vivo (cámara FaceTime HD/Continuity + ventana + imagen/vídeo local) sin cortes de grabación, persistencia real de `optica_studio_assets_db` tras reiniciar la app y fluidez de `⌘Z` / `⇧⌘Z`.
+
+### CP-P02-C3 — Transparencia del presentador y visor limpio (2026-11-28)
+
+- Desarrollo local independiente a partir de `DEV-P02C2`, integrado sobre la base `CP-P02-C2` sin sobrescribir archivos Electron (`electron/main.ts`, `electron/preload.ts`), `package-lock.json` ARM64, iconos ni `.github/workflows/*`.
+- **Visor libre de superposiciones de detección:** Eliminados el marco verde y el rótulo `Sujeto N · XX%` del visor (`CameraViewport.tsx` y cualquier vista de programa/pantalla completa/Cinema/PiP); se conservan el reconocimiento interno (`FaceDetector`), el autofoco (`aiAutoFocus`) y la lectura técnica diagnóstica exclusivamente fuera del visor principal (`SidebarControls.tsx`). Los manejadores de transformación y redimensionado de la capa seleccionada (`selectedVisualLayer`) se mantienen intactos.
+- **Transparencia real de sujeto:** Modo `Quitar fondo · Transparente` en **Filtros** cuando `studioPanel?.engineMode === 'studio'`. MediaPipe local (`ImageSegmenter`) genera máscara de confianza real (`384 px` lado mayor). `SubjectMatte` (`src/utils/subjectMatte.ts`) conserva alfa fraccional, inicializa sin fundido artificial en `0`/`1`, responde al movimiento y descarta historial tras cambio de fuente, geometría, ajustes o pausa (`> 250 ms`).
+- **Aislamiento y fallbacks seguros:** La máscara se aplica al final del procesamiento aislado de cámara mediante `destination-in` dentro de `renderCameraFrame`; `ProgramCompositor` usa alfa recto (`hasTransparentSubject` / `alphaMode: 'straight'`) únicamente si se produjo y aplicó realmente una máscara. Capas `window`/`screen` no pasan por segmentación ni LUTs de cámara. Si el modelo está cargando o falla, se mantiene la cámara con fondo original (sin simular recorte), se registra el error con enfriamiento (`1500 ms`) y recuperación hacia CPU (`preferCpuSegmenter`). Los efectos geométricos incompatibles (`kaleidoscope-2`, `kaleidoscope-4`, `pop-art`, `pixelate`, `cyberpunk-glitch`, `vhs-retro`) se suspenden durante el recorte transparente; el modo `Legacy` conserva el fondo.
+- **Pruebas y verificación:**
+  - En este entorno de integración: `npm test` **107/107** (`102` anteriores + `5` nuevas pruebas unitarias en `tests/subjectMatte.test.ts`), `npm run lint` (`tsc --noEmit && tsc -p electron/tsconfig.json --noEmit`) **0 errores**, y `npm run desktop:build` (`icons:build` + `vite build` + `build-electron.mjs`) correcto.
+  - Según registro externo de compilación macOS ARM64 (`DEV-P02C3`): empaquetado ARM64 y codesign ad hoc en `/Applications/Optica Studio.app` (`app.asar` SHA-256 `2ee24493776a8b120ce9fd37a05f2be43d0d3357b041f82e7f9187b9def81474`), y arnés aislado `tests/electron/c3-runner.cjs` + `tests/electron/c3-pixels.ts` (píxeles reales iguales en Canvas2D y WebGL2: ventana `[36,104,172,255]`, sujeto `[255,255,255,255]`, borde `[146,180,214,255]`; MediaPipe local sin red produjo máscara `384x216` con fallback al cargar, fallo controlado y recuperación CPU). Los patrones gráficos del arnés existen solo en pruebas, nunca como fuentes de producción. *No ejecutado todavía en hardware físico con persona real, cabello/manos ni FPS sostenidos.*
+- **Manual NextGen V3.1:** Documentar `Filtros > Recorte de Sujeto con IA > Quitar fondo · Transparente`, botón `Restaurar fondo original`, sensibilidad/suavizado, capa de ventana debajo de cámara y estado de recuperación.
+- **Estado de cierre:** Rechazado durante validación física inicial en macOS ARM64; sucedido por `CP-P02-C3-R1` y `CP-P02-C3-R2`.
+
+### CP-P02-C3-R1 y CP-P02-C3-R2 — Calidad visual del recorte, colocación detrás de cámara y administrador múltiple de fuentes (2026-11-28)
+
+- **Integración R1 + implementación R2 (`CP-P02-C3-R2`):** Consolidada la base local `OpticaStudio-CP-P02-C3-R1-sync.txt` y completado **`CP-P02-C3-R2`** manteniendo intactos `package-lock.json`, `electron/main.ts`, `electron/preload.ts`, `electron-builder.yml`, `.github/workflows/*`, iconos y `/public/mediapipe/*`.
+- **Calidad visual del recorte del presentador (`src/utils/subjectMatte.ts`, `src/utils/aiVision.ts`, `src/utils/canvasProcessor.ts`, `src/engine/programCompositor.ts`, `src/App.tsx`):**
+  - La inferencia neuronal sigue ejecutándose sobre el modelo local `selfie_segmenter_landscape.tflite` (`ImageSegmenter` vía GPU con respaldo automático CPU tras enfriamiento, sin descarga externa en runtime).
+  - Refinado el postprocesado de máscara mediante **Filtro Guiado 3D en espacio YCbCr O(N) separable (`refineGuidedAlpha`)** con buffers reutilizables de cero asignaciones por fotograma, separación cromática para bordes isoluminantes, bloqueo de interior/fondo definidos y suavizado perimetral más ceñido (`applySubjectAlpha`).
+  - `SubjectMatte` incorpora respuesta temporal adaptativa ante movimiento rápido de sujeto sin fundidos artificiales y manteniendo historial por geometría/fuente/pausa.
+  - Descontaminación de color de borde en CPU (`decontaminateEdgeColors`) y en GPU (`Webgl2CompositorBackend`, muestreo 4-vecino protegido estrictamente bajo `u_hasTransparentAlpha == 1 && u_alphaMode == 1 && a > 0.005 && a < 0.92`) combinada con carga de textura `gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL = 1` cuando el canal alfa premultiplicado proviene del lienzo procesado de cámara (`alphaMode: 'premultiplied'`).
+- **Profundidad intuitiva y colocación detrás de cámara (`src/engine/studioCoordinator.ts`, `src/engine/layerEditor.ts`, `src/components/LeftStudioPanel.tsx`, `src/components/SidebarControls.tsx`):**
+  - Las fuentes de captura nuevas o reutilizadas (`screen` / `window`) se insertan por defecto **detrás de la capa de cámara** (`placement: 'behind-camera'`) en la escena activa sin cubrir automáticamente al presentador.
+  - Controles rápidos en 1 clic (`Detrás de cámara`, `Traer al frente`, `Subir`, `Bajar`, `Al fondo`) en `Capas` y en el inspector, más aviso contextual no intrusivo cuando una ventana/pantalla queda detrás de una cámara opaca a pantalla completa (`100 %`).
+  - Nuevas composiciones rápidas **`Pantalla + presentador transparente`** (`screen-main-transparent-presenter`) y **`Pantalla + ventana PiP`** (`screen-main-window-pip`), con selectores explícitos **Principal** y **Secundaria** en el inspector y `Deshacer / Rehacer` en un único paso sin reabrir hardware.
+- **Administrador profesional de múltiples pantallas y ventanas (`src/engine/sourceManager.ts`, `src/components/CameraViewport.tsx`, `src/components/LeftStudioPanel.tsx`, `src/App.tsx`):**
+  - Soporte simultáneo real de varias pantallas y ventanas en vivo dentro de la misma escena/proyecto con `sourceId`/`layerId` únicos, numeración automática legible, resolución nativa viva (`W×H`), renombrado no destructivo (`renameProjectSource`), reutilización en otras escenas sin nueva captura (`+ Detrás`), selector Liquid Glass **Fuentes compartidas** anclado sobre **Compartir pantalla** en `CameraViewport` y enrutamiento de audio por fuente (`Map<string, MediaStreamAudioSourceNode>`) para evitar desconectar capturas previas.
+  - **`Cambiar captura` no destructivo (`reconnectSource(..., { force: true })`):** Conserva intacto el `MediaStream` activo y su estado `'live'` si el usuario cancela el selector nativo (`AbortError` o `NotAllowedError` en Chromium/Electron) y detiene la pista previa únicamente tras confirmar la nueva captura.
+  - **Visor limpio conservado:** Cero recuadros o porcentajes de detección (`Sujeto 1`, `%`) sobre `CameraViewport` ni sobre la salida `ProgramCanvas`.
+- **Verificación automatizada en Node.js (`CP-P02-C3-R2`):**
+  - `npm test` (`tsx --test tests/*.test.ts`): **117/117 pruebas superadas** (110 heredadas de R1 + 7 nuevas pruebas de `CP-P02-C3-R2` en `subjectMatte.test.ts`, `programCompositor.test.ts`, `sourceManager.test.ts`, `layerEditor.test.ts` y `studioIntegration.test.ts` mediante adaptadores simulados).
+  - `npm run lint` (`tsc --noEmit && tsc -p electron/tsconfig.json --noEmit`): **0 errores**.
+  - `npm run desktop:build` (`icons:build` + `vite build` + `build-electron.mjs`): compilación limpia sin archivos `*sync*` en la distribución final.
+  - *Pendiente de validación física en macOS ARM64:* comprobación real en Electron Desktop Apple Silicon con WebGL2/ANGLE/Metal, cámara real en movimiento, cabello/manos sobre pantalla compartida y captura simultánea de varias ventanas/pantallas antes de aprobar `CP-P02` o iniciar `CP-P03-A`.
+
+---
+
+## 12. Auditoría Técnica Profunda del Pipeline Audiovisual (`CP-P03`)
+
+Auditoría realizada directamente sobre los 9 módulos del motor audiovisual antes de iniciar implementaciones de `CP-P03`:
+
+1. **`src/utils/webglEffects.ts`:**
+   - Mantiene un singleton global (`state: WebglPipelineState | null`, `webglUnavailable`) sobre un único `<canvas>` WebGL2 con `preserveDrawingBuffer: true` y una única textura compartida.
+   - Redimensiona `canvas.width/height` globalmente cuando cambia el tamaño de entrada; el shader escribe `outColor = vec4(..., 1.0)` (destruyendo alfa si se usara sobre superficies transparentes) y `dstCtx.drawImage(canvas, ...)` fuerza lectura/copia GPU→CPU 2D por cada pasada (`applyWebglColorFilter` y `applyWebglVisualEffect`), provocando múltiples subidas de textura por fotograma al entrar luego en `ProgramCompositor`.
+   - Carece de limpieza explícita (`disposeWebglEffects`) y manejador de pérdida de contexto WebGL (`webglcontextlost`/`restored`).
+2. **`src/utils/aiVision.ts` y `src/utils/subjectMatte.ts`:**
+   - `SubjectMatte` está limpio y desacoplado del DOM, pero `aiVision.ts` mantiene una única instancia global `subjectMatte`, `matteSource`, `matteGeometry`, `lastSegTs`, `lastDetTs` y lienzos scratch compartidos (`segInputCanvas`, `segOutCanvas`, `segOutImgData`, `detInputCanvas`).
+   - Con dos cámaras o fuentes con segmentación simultánea en el mismo fotograma, `setAiSegmentationSource` reiniciaría el buffer temporal en cada alternancia, anulando la estabilidad de `SubjectMatte`.
+   - `FaceDetector` fija `inW = 320` en lugar de escalado proporcional por lado mayor (`384`) o seguimiento por fuente; falta `disposeAiVision()` para liberar explícitamente `ImageSegmenter`/`FaceDetector` y lienzos auxiliares.
+3. **`src/utils/canvasProcessor.ts`:**
+   - Buffers globales compartidos a nivel de módulo (`workCanvas`, `rawCanvas`, `pixelCanvas`, `blurCanvas`, `rotCanvas`, `stabCanvas`, `prevStabLum`, `stabCompX`, `stabCompY`, `segSampleCanvas`, `segMaskCanvas`, `segFgCanvas`, `prevSegMask`, `calibratedBgYCbCr`, `prevMotionBuffer`, `motionSampleCanvas`). Dos cámaras o vídeos simultáneos corrompen la estabilización, el fondo calibrado YCbCr y la máscara temporal entre sí.
+   - Asignaciones por fotograma en ruta caliente: `document.createElement('canvas')` cuando `screenSource` y `effectId !== 'none'`; `new Float32Array(STAB_W * STAB_H)` + `getImageData` síncrono en `updateStabilizationDisplacement`; `createImageData` / `getImageData` en `applyBackgroundSegmentation` y `renderFocusPeakingOverlay`; `bgImageCache` (`Map`) sin poda ni liberación de `blob:` URLs obsoletas.
+4. **`src/App.tsx`, `src/engine/studioCoordinator.ts` y `src/hooks/useStudioEngine.ts`:**
+   - **Cuello de botella mono-cámara:** El bucle principal en `App.tsx` procesa únicamente la primera cámara (`getActiveCameraVideoElement()`) sobre un único `processedCameraCanvasRef` y llama a `coordEngine.setProcessedCameraSurface(...)`, el cual resuelve únicamente `this.project.sources.find((s) => s.kind === 'camera')`. Cámaras secundarias, capas `video-file` y capas duplicadas con `overrideSourceProcessing: true` (`SceneLayer.processing` ya tipado en `src/types/studio.ts`) quedan sin procesamiento independiente.
+   - **Doble copia de presentación:** En modo Studio, `App.tsx` copia cada fotograma del `ProgramCanvas` WebGL2 de salida (`1080p`/`4K`) a otro `<canvas>` 2D en `CameraViewport` mediante `ctx.drawImage(progCanvas, ...)` a 60 fps, duplicando ancho de banda de composición y lectura.
+5. **`src/engine/programCompositor.ts`:**
+   - `Webgl2CompositorBackend` ejecuta `gl.getUniformLocation(...)` en **cada uniforme, cada capa y cada fotograma** dentro de `drawTexturedLayerQuad`, `drawSolidQuad`, `drawShadowQuad`, `bindCommonStyleUniforms` y `renderFadeTransition` en lugar de cachear ubicaciones al compilar el programa; además instancia `new Float32Array(...)` en cada matriz/transición.
+   - `Webgl2CompositorBackend` ignora `cmd.blendMode` (`screen`, `multiply`, `overlay` solo están activos en `Canvas2dCompositorBackend`).
+   - `StaticGraphicRasterCache` y `computeFrameSignature` usan `JSON.stringify` por fotograma sobre capas gráficas.
+   - `pruneUnusedResources()` no purga entradas obsoletas de `this.processedSurfaces` (`Map<string, ProcessedLayerSurface>`), quedando retenidas hasta recibir `null` explícito.
+   - `Canvas2dCompositorBackend` ejecuta trigonometría/potencias por píxel en CPU al cambiar dimensiones/forma/difuminado (`applyPerimeterFeatherToRgbaBuffer`) y usa `ctx.shadowBlur` por software cuando cae a Canvas2D.
+6. **`src/engine/sourceManager.ts`:**
+   - La gestión de pistas, `trackOwners`, `operationToken`, `cleanupCallbacks` e IndexedDB (`optica_studio_assets_db`) es sólida. Requiere enlazar el ciclo de desconexión/eliminación de fuentes con el registro de contextos de procesamiento por fuente/capa para liberar automáticamente `SubjectMatte`, texturas GPU y `processedSurfaces` sin fugas.
+
+---
+
+## 13. Alcance Técnico Concreto de `CP-P03-A` (Pendiente de aceptación física de `C3`)
+
+> **Regla de parada:** No iniciar la implementación de `CP-P03-A` hasta confirmar la aceptación física de `CP-P02-C3-R2` en macOS ARM64.
+
+1. **Aislamiento de estado por fuente/capa (`ProcessingContext`):**
+   - Encapsular los buffers de `canvasProcessor.ts`, `webglEffects.ts` y `SubjectMatte` (`aiVision.ts`) por clave determinista (`sourceId` por defecto, o `layerId` cuando `layer.overrideSourceProcessing === true`), eliminando las variables globales compartidas entre cámaras.
+2. **Pipeline multi-fuente conectado a `ProgramCompositor`:**
+   - Sustituir el puente único `setProcessedCameraSurface` por procesamiento multi-fuente sobre `ProgramCompositor.setProcessedLayerSurface(targetKey, ...)`, dando soporte a múltiples cámaras, `video-file` y overrides por capa sin contaminar jamás `window` ni `screen`, manteniendo compatibilidad con el modo `Legacy`.
+3. **Eliminación de asignaciones en caliente y caché GPU:**
+   - Pre-asignar buffers reutilizables por contexto (eliminando `createElement('canvas')`, `new Float32Array` y `createImageData` por fotograma en ruta crítica); cachear `WebGLUniformLocation` y matrices en `Webgl2CompositorBackend`; soportar `blendMode` consistente en WebGL2 y podar `processedSurfaces` + `bgImageCache` + contextos huérfanos en `SourceManager` y `ProgramCompositor.pruneUnusedResources()`.
+4. **Conservación estricta:**
+   - Cero regresiones sobre `CP-P02-C1`, `CP-P02-C2` y `CP-P02-C3` (sin rótulos ni cajas de sujeto en visores; `SubjectMatte` y fallbacks íntegros).
+
+---
+
+## 14. Hoja de Ruta Oficial Actualizada
+
+- `CP-P02-C3-R1 / CP-P02-C3-R2`: Calidad visual del recorte y administrador múltiple de fuentes — **Implementado y verificado en pruebas automatizadas Node/TS; pendiente de validación y aceptación física en macOS ARM64**.
+- **`CP-P03` (`CP-P03-A` .. `CP-P03-E`)**: Motor audiovisual profesional de alto rendimiento — contextos por fuente/capa, unificación GPU WebGL2/Metal vía ANGLE, eliminación de copias intermedias y optimización sostenida en 1080p/4K Apple Silicon.
+- **`CP-P04`**: Audio multipista, mezcla en tiempo real, monitorización y sincronización A/V.
+- **`CP-P05`**: Grabación incremental en disco (IPC Electron seguro) y recuperación ante cortes o fallos.
+- **`CP-P06`**: Productividad de estudio, perfiles, atajos avanzados y flujo de edición profesional.
+- **`CP-FINAL`**: Auditoría integral de código, manual de usuario NextGen V3.1 completo, verificación de rendimiento sostenido, empaquetado final y publicación en GitHub solo bajo autorización explícita.
+
+## Registro local — CP-P02-C3-R2 (2026-11-28)
+
+- Export directo Google AI Studio, ZIP SHA-256 04faac37fb2ef1db20a70c1e5d391535f99d59393bdfa7fd47c69337ed40ccca, 84 archivos. Comparado con DEV-P02C3-R1. Lockfile ARM64 e iconos restaurados desde R1 por diferencias de exportación; Electron, workflows, package.json y modelos MediaPipe idénticos. Sin archivos de sincronización en dist.
+- npm test 117/117, lint y desktop:build correctos. Arnés Electron local sin red correcto en Canvas2D/WebGL2; añadida comprobación local específica del alfa premultiplicado usado por R2, borde [146,180,214,255] en ambos backends y ventana intacta. MediaPipe local, recuperación CPU y refinamiento 960x540 correctos. No se probó cámara/pantallas físicas.
+- Regresión de rendimiento: mismo arnés controlado, tras recuperación CPU, R1 11,6–15,9 ms por muestra de pipeline de máscara; R2 66,3–75,2 ms, repetición 66,7–79,1 ms. Medir y perfilar antes de aprobar. No equivale a FPS de captura/grabación. No se afirma calidad visual mejorada sin persona real.
+- Paquete ARM64 firmado ad hoc, codesign correcto, no notarizado. app.asar SHA-256 42ef9ec686518ac1907ccb2315ff8e56ddfb73690a74300978cc10cef705635c. Paquete preparado en release/mac-arm64/Optica Studio.app. La app anterior permanece abierta; no se pudo comprobar si graba. No se reemplazó. Repositorio principal intacto, sin push/releases. CP-P03-A permanece bloqueado.
+
+
+### Instalación local R2 — 20261128-095755
+
+- Usuario confirmó que no había grabación activa y autorizó continuar. Cierre normal de C3-SYNC, respaldo del perfil y sustitución reversible en /Applications/Optica Studio.app. Firma local y SHA-256 verificados: 42ef9ec686518ac1907ccb2315ff8e56ddfb73690a74300978cc10cef705635c.
+- Respaldo: ~/Documents/OpticaStudio-respaldo-perfil-R2-20261128-095755. Rollback: ~/.Trash/OpticaStudio-rollback-C3-SYNC-20261128-095755.
+- Pendiente prueba física de recorte, varias capturas simultáneas, orden de capas y fluidez. No iniciar CP-P03-A ni publicar.
+
+## CP-P02-C3-R3 — Optimización exacta del refinamiento de bordes (2026-11-28)
+
+- El usuario confirma que el recorte R2 se ve muy bien, pero la fluidez bajó significativamente. No se declara aprobado C3. Se conserva modelo, resolución 960x540, cámara hasta 1920 px, respuesta temporal, alfa premultiplicado, descontaminación GPU y administrador múltiple R2.
+- Cambio localizado en subjectMatte.ts: regiones de 48x48 activadas únicamente si contienen alfa incierto y variación suficiente para entrar en la rama guiada. Halo de 2 radios para preservar soporte de las dos etapas del filtro. Si la máscara es densa, ruta completa. Se reutilizan índices de interpolación y sumas verticales; no se altera el algoritmo YCbCr ni se reduce resolución. No se reutilizan máscaras antiguas.
+- Comparación local contra implementación original R2 en 5 patrones deterministas 960x540: diferencia máxima alfa 0/255 en todos. Refinamiento solo, silueta central R2 56,1–58,4 ms vs R3 20,6–20,9 ms; silueta cerca del borde R2 56,3–58,2 vs R3 14,7–15,1 ms; máscara densa aún 64,1–71,5 ms. No es cámara real.
+- Arnés Electron controlado, pipeline máscara tras recuperación CPU: R2 66,3–79,1 ms vs R3 12,2–18,3 ms; patrón uniforme, no FPS reales ni calidad de persona. WebGL2 y Canvas2D, alfa recto/premultiplicado, MediaPipe local y recuperación CPU correctos.
+- 119/119 tests (2 nuevas regresiones de bordes de bloques y ausencia de alfa residual); lint, desktop:build, empaquetado ARM64 y firma ad hoc correctos. SHA-256 app.asar ca9d2808f8d3fd48096f025d77c88cb9b7187ac202501429d279739eeb3ece0e. Lockfile, Electron y CI idénticos. Sin push/release.
+- Pendiente prueba física de fluidez y calidad, grabación con fuentes compartidas, diagnóstico de casos densos si persisten. No iniciar CP-P03-A hasta aceptación. Parche de sincronización local R3 preparado.
+
+
+### Instalación local R3 — 20261128-101024
+
+- Cierre normal de R2, perfil respaldado, sustitución reversible de la app y firma verificada. Instalado R3 SHA-256 ca9d2808f8d3fd48096f025d77c88cb9b7187ac202501429d279739eeb3ece0e.
+- Respaldo: ~/Documents/OpticaStudio-respaldo-perfil-R3-20261128-101024. Rollback: ~/.Trash/OpticaStudio-rollback-R2-20261128-101024. Pendiente validación física.
+
+### CP-P02-C3-R3 — Aprobación física del recorte (2026-11-28)
+
+- El usuario confirma: «AHora si, queda aprobado el recorte.» Se acepta la calidad visual y la fluidez del recorte R3. No extender esta aprobación al resto de las funcionalidades de C3 sin confirmación expresa. Mantener algoritmo y pruebas. Pendiente validar captura múltiple, selección, profundidad y grabación; sincronizar R3 con Google AI Studio antes de CP-P03-A.
+
+### CP-P02 — Cierre de aceptación física (2026-11-28)
+
+- El usuario confirma que también aprueba las tres validaciones restantes: múltiples pantallas simultáneas, selección y profundidad independiente de fuentes R2, y grabación multicapa. Se suma a la aprobación física del recorte R3 y a las aprobaciones previas de C1/C2. CP-P02 queda aprobado funcional y físicamente por el usuario.
+- Base aprobada: DEV-P02C3-R3, 119/119 pruebas automatizadas, app ARM64 instalada. Conservar el refinamiento de alfa R3 y todas las funciones aprobadas.
+- Pendiente exclusivamente sincronización del parche R3 y de este cierre con Google AI Studio antes de comenzar CP-P03-A. No se ha iniciado CP-P03-A; sin push ni release.
+
+## Flujo de desarrollo compartido por GitHub
+
+- Base aprobada: CP-P02-C3-R3, 119 pruebas, validación física completa.
+- Rama DEV propuesta: dev. main permanece estable; no push directo, merge ni release sin autorización.
+- Un solo editor activo por checkpoint. Antes de editar, verificar HEAD remoto y traer cambios. Al terminar, ejecutar pruebas, actualizar PROJECT-MASTER.md, commit y sincronizar únicamente dev. Nunca force-push; ante divergencia comparar y reconciliar antes de continuar.
+- Proteger lockfile ARM64, Electron, workflows, recursos locales, iconos y decisiones aprobadas. No versionar perfiles, medios privados, credenciales, archivos de sincronización ni compilaciones.
+- CP-P03-A comienza solamente tras comprobar sincronización bidireccional con la base aprobada.

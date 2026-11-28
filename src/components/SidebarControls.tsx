@@ -12,6 +12,8 @@ import {
   Focus,
   Grid,
   Layers,
+  Lock,
+  Maximize2,
   Mic,
   MicOff,
   Monitor,
@@ -27,6 +29,7 @@ import {
   Sliders,
   Sun,
   Timer,
+  Unlock,
   Upload,
   UserCheck,
   Video,
@@ -71,10 +74,35 @@ import type { HistogramData } from '../utils/canvasProcessor';
 import type { EngineCompatibilityItem, EngineMode } from '../engine/engineCompatibility';
 import type { CompositorBackendKind } from '../engine/programCompositor';
 import type {
+  AddRealSourceRequest,
+  AddRealSourceResult,
+  CompositionHistoryStatus,
   PreferredCompositorBackend,
+  RemoveSourceResult,
   StudioDiagnosticsSnapshot,
 } from '../engine/studioCoordinator';
-import type { SceneTransition, StudioPresetId, StudioScene } from '../types/studio';
+import type {
+  CameraAspectPreset,
+  LayerMaskShape,
+  LayerStyle,
+  LayerTransform,
+  SceneLayer,
+  SceneTransition,
+  StudioPresetId,
+  StudioScene,
+  StudioSource,
+} from '../types/studio';
+import {
+  ADAPTABLE_COMPOSITIONS,
+  type AdaptableSceneLayoutId,
+  computeLayerAspectTransform,
+  computeProportionalLayerTransform,
+  computeScaledLayerWidthTransform,
+  getLayerNormalizedRect,
+  isVisualSourceEditable,
+  rectToLayerTransform,
+  resolveTargetEditableLayer,
+} from '../engine/layerEditor';
 import type {
   AppearanceSettings,
   ResolvedAppearanceState,
@@ -99,9 +127,14 @@ export interface StudioEnginePanelProps {
   isRecordingLocked: boolean;
   activeSceneId: string;
   scenes: StudioScene[];
+  projectSources: StudioSource[];
   sources: StudioDiagnosticsSnapshot['sources'];
+  outputWidth: number;
+  outputHeight: number;
+  selectedLayerId: string | null;
   hasLiveDisplaySource: boolean;
   lastError: string | null;
+  historyStatus?: CompositionHistoryStatus;
   diagnosticsSnapshot: StudioDiagnosticsSnapshot | null;
   compatibilityMatrix: readonly EngineCompatibilityItem[];
   onSwitchEngineMode: (mode: EngineMode) => Promise<void> | void;
@@ -113,11 +146,74 @@ export interface StudioEnginePanelProps {
     presetId: StudioPresetId,
     transitionOverride?: Partial<Pick<SceneTransition, 'type' | 'durationMs'>>
   ) => void;
-  onAuthorizeDisplaySource: () => void;
+  onAuthorizeDisplaySource: (sourceId?: string) => void;
+  onReconnectSource?: (sourceId: string) => void;
+  onAddDisplaySource?: (kind: 'screen' | 'window') => Promise<void> | void;
   onChangeBackendPreference: (backend: PreferredCompositorBackend) => void;
   onRecoverCanvas2dFallback: () => void;
   onRefreshDiagnostics: () => void;
   onResetProject: () => void;
+  onSelectLayer: (layerId: string | null) => void;
+  onUpdateLayerTransform: (
+    sceneId: string,
+    layerId: string,
+    transformPatch: Partial<LayerTransform>,
+    options?: { preserveAspectK?: number; historyGroupKey?: string; historyLabel?: string }
+  ) => void;
+  onUpdateLayerStyle?: (
+    sceneId: string,
+    layerId: string,
+    stylePatch: Partial<LayerStyle>,
+    options?: { historyGroupKey?: string; historyLabel?: string }
+  ) => void;
+  onApplyAdaptableLayout?: (
+    sceneId: string,
+    layoutId: AdaptableSceneLayoutId,
+    options?: {
+      participatingLayerIds?: string[];
+      primaryDisplayLayerId?: string;
+      secondaryDisplayLayerId?: string;
+      primaryCameraLayerId?: string;
+    }
+  ) => void;
+  onToggleLayerLock: (sceneId: string, layerId: string, locked: boolean) => void;
+  onReorderLayers?: (sceneId: string, orderedLayerIds: string[]) => void;
+  onMoveLayerOrder?: (
+    sceneId: string,
+    layerId: string,
+    direction: 'up' | 'down' | 'top' | 'bottom'
+  ) => void;
+  onPlaceLayerBehindCamera?: (sceneId: string, layerId: string) => void;
+  onToggleLayerVisible?: (
+    sceneId: string,
+    layerId: string,
+    visible: boolean
+  ) => Promise<{ ok: boolean; reason?: string } | void> | void;
+  onRenameLayer?: (sceneId: string, layerId: string, newName: string) => void;
+  onDuplicateLayer?: (
+    sceneId: string,
+    layerId: string
+  ) => { ok: boolean; layer?: SceneLayer | null } | void;
+  onResetLayerTransform?: (sceneId: string, layerId: string) => void;
+  onResetLayerStyle?: (sceneId: string, layerId: string) => void;
+  onRemoveLayer?: (sceneId: string, layerId: string) => { ok: boolean; reason?: string } | void;
+  onAddRealSource?: (
+    sceneId: string,
+    request: AddRealSourceRequest
+  ) => Promise<AddRealSourceResult>;
+  onAddExistingSourceToScene?: (
+    sceneId: string,
+    sourceId: string,
+    options?: { placement?: 'behind-camera' | 'top'; name?: string }
+  ) => Promise<AddRealSourceResult>;
+  onRenameProjectSource?: (
+    sourceId: string,
+    newName: string
+  ) => { ok: boolean; reason?: string };
+  onRemoveSourceSafely?: (sourceId: string) => Promise<RemoveSourceResult>;
+  onEnumerateDevices?: () => Promise<Array<{ deviceId: string; kind: string; label: string }>>;
+  onUndo?: () => Promise<void> | void;
+  onRedo?: () => Promise<void> | void;
 }
 
 interface SidebarControlsProps {
@@ -262,6 +358,8 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
   const [internalStudioLabOpen, setInternalStudioLabOpen] = useState(false);
   const [studioTransitionType, setStudioTransitionType] = useState<'cut' | 'fade'>('fade');
   const [showCompatMatrix, setShowCompatMatrix] = useState(false);
+  const [compPrimaryDisplayId, setCompPrimaryDisplayId] = useState<string>('');
+  const [compSecondaryDisplayId, setCompSecondaryDisplayId] = useState<string>('');
 
   const isStudioLabOpen = props.studioLabOpen ?? internalStudioLabOpen;
   const setStudioLabOpen = (next: boolean) => {
@@ -296,6 +394,130 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
   const matchedZoomPreset =
     zoomPresetOptions.find((opt) => Math.abs(props.zoom - parseFloat(opt.id)) < 0.08)?.id ?? '1';
 
+  const studioPanel = props.studioEnginePanel;
+  const activeStudioScene =
+    studioPanel?.engineMode === 'studio'
+      ? studioPanel.scenes.find((s) => s.id === studioPanel.activeSceneId) ?? null
+      : null;
+  const projectSources = studioPanel?.projectSources ?? [];
+  const visualLayersInScene = activeStudioScene
+    ? [...activeStudioScene.layers]
+        .filter((l) =>
+          isVisualSourceEditable(projectSources.find((s) => s.id === l.sourceId))
+        )
+        .sort((a, b) => b.zIndex - a.zIndex)
+    : [];
+  const displayLayersInScene = visualLayersInScene.filter((l) => {
+    const k = projectSources.find((s) => s.id === l.sourceId)?.kind;
+    return k === 'screen' || k === 'window';
+  });
+  const resolvedPrimaryDisplayId = displayLayersInScene.some(
+    (l) => l.id === compPrimaryDisplayId
+  )
+    ? compPrimaryDisplayId
+    : displayLayersInScene[0]?.id ?? '';
+  const secondaryDisplayCandidates = displayLayersInScene.filter(
+    (l) => l.id !== resolvedPrimaryDisplayId
+  );
+  const resolvedSecondaryDisplayId = secondaryDisplayCandidates.some(
+    (l) => l.id === compSecondaryDisplayId
+  )
+    ? compSecondaryDisplayId
+    : secondaryDisplayCandidates[0]?.id ?? '';
+  const activeEditableLayer = activeStudioScene
+    ? resolveTargetEditableLayer(
+        activeStudioScene,
+        projectSources,
+        studioPanel?.selectedLayerId ?? null
+      )
+    : null;
+  const activeEditableSource = activeEditableLayer
+    ? projectSources.find((s) => s.id === activeEditableLayer.sourceId) ?? null
+    : null;
+  const activeEditableRuntime = activeEditableSource
+    ? studioPanel?.sources.find((s) => s.id === activeEditableSource.id) ?? null
+    : null;
+  const activeEditableDiagLayer = activeEditableLayer
+    ? studioPanel?.diagnosticsSnapshot?.layerDiagnostics.find(
+        (l) => l.layerId === activeEditableLayer.id
+      ) ?? null
+    : null;
+  const isCameraTarget = activeEditableSource?.kind === 'camera';
+  const isDisplayTarget =
+    activeEditableSource?.kind === 'window' || activeEditableSource?.kind === 'screen';
+  const activeIntrinsicW = isCameraTarget
+    ? activeEditableDiagLayer?.intrinsicWidth || props.sensorSize.w
+    : activeEditableDiagLayer?.intrinsicWidth ||
+      (activeEditableSource &&
+      'intrinsicWidth' in activeEditableSource &&
+      activeEditableSource.intrinsicWidth
+        ? activeEditableSource.intrinsicWidth
+        : 0) ||
+      studioPanel?.outputWidth ||
+      1920;
+  const activeIntrinsicH = isCameraTarget
+    ? activeEditableDiagLayer?.intrinsicHeight || props.sensorSize.h
+    : activeEditableDiagLayer?.intrinsicHeight ||
+      (activeEditableSource &&
+      'intrinsicHeight' in activeEditableSource &&
+      activeEditableSource.intrinsicHeight
+        ? activeEditableSource.intrinsicHeight
+        : 0) ||
+      studioPanel?.outputHeight ||
+      1080;
+  const editableLayerRect = activeEditableLayer
+    ? getLayerNormalizedRect(activeEditableLayer.transform)
+    : null;
+  const isEditableLayerSelected = Boolean(
+    activeEditableLayer && studioPanel?.selectedLayerId === activeEditableLayer.id
+  );
+  const editableAspectPreset: CameraAspectPreset =
+    activeEditableLayer?.transform.aspectPreset ?? 'sensor';
+  const editableMaskShape: LayerMaskShape =
+    activeEditableLayer?.style.maskShape ?? 'rect';
+  const editableBorderEnabled = activeEditableLayer
+    ? (activeEditableLayer.style.borderEnabled ??
+      activeEditableLayer.style.borderWidthPx > 0)
+    : false;
+  const editableFeatherPx = activeEditableLayer?.style.featherPx ?? 0;
+  const editableCrop = activeEditableLayer?.transform.crop ?? {
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  };
+  const hasActiveCrop =
+    editableCrop.top > 0.001 ||
+    editableCrop.bottom > 0.001 ||
+    editableCrop.left > 0.001 ||
+    editableCrop.right > 0.001;
+  const editableSourceKindLabel =
+    activeEditableSource?.kind === 'camera'
+      ? 'Cámara'
+      : activeEditableSource?.kind === 'window'
+        ? 'Ventana'
+        : activeEditableSource?.kind === 'screen'
+          ? 'Pantalla'
+          : activeEditableSource?.kind === 'image'
+            ? 'Imagen'
+            : activeEditableSource?.kind === 'video-file'
+              ? 'Video'
+              : activeEditableSource?.kind === 'text'
+                ? 'Texto'
+                : activeEditableSource?.kind === 'color' ||
+                    activeEditableSource?.kind === 'gradient'
+                  ? 'Fondo'
+                  : 'Capa visual';
+
+  const maskShapeLabels: Record<LayerMaskShape, string> = {
+    rect: 'Rectángulo',
+    square: 'Cuadrado',
+    rounded: 'Redondeado',
+    squircle: 'Squircle',
+    circle: 'Círculo',
+    ellipse: 'Elipse',
+  };
+
   return (
     <GlassInspector ariaLabel="Inspector contextual de Óptica Studio">
       {/* Subnavegación segmentada del espacio Estudio */}
@@ -322,8 +544,13 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
         {(activeTab === 'studio' || activeTab === 'utilities') && studioSubTab === 'optics' && (
           <>
             <GlassDisclosure
-              title="Cámara y Encuadre"
-              defaultOpen
+              title="Cámara física"
+              subtitle={
+                studioPanel?.engineMode === 'studio'
+                  ? 'Hardware y salida óptica base'
+                  : undefined
+              }
+              defaultOpen={studioPanel?.engineMode !== 'studio' || isCameraTarget}
               badge={
                 <GlassIconButton
                   size="sm"
@@ -432,9 +659,1268 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
               </div>
             </GlassDisclosure>
 
+            {studioPanel?.engineMode === 'studio' &&
+              activeStudioScene &&
+              activeEditableLayer &&
+              editableLayerRect && (
+                <>
+                  <div className="py-2.5 border-b border-[var(--border-hairline)] space-y-2">
+                    <div className="flex items-center justify-between gap-2 text-[11px]">
+                      <span className="inline-flex items-center gap-1.5 font-semibold text-[var(--text-primary)] truncate">
+                        {isDisplayTarget ? (
+                          <Monitor className="w-3.5 h-3.5 text-[var(--accent-blue)] shrink-0" />
+                        ) : isCameraTarget ? (
+                          <Camera className="w-3.5 h-3.5 text-[var(--accent-blue)] shrink-0" />
+                        ) : (
+                          <Layers className="w-3.5 h-3.5 text-[var(--accent-blue)] shrink-0" />
+                        )}
+                        Capa en edición · {editableSourceKindLabel}
+                      </span>
+                      <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)] shrink-0">
+                        {isDisplayTarget && activeEditableRuntime?.status !== 'live'
+                          ? 'Sin captura'
+                          : `${Math.round(activeIntrinsicW)}×${Math.round(activeIntrinsicH)}`}
+                      </span>
+                    </div>
+
+                    {visualLayersInScene.length > 0 && (
+                      <GlassSelect
+                        aria-label="Seleccionar capa visual a editar"
+                        value={activeEditableLayer.id}
+                        onChange={(e) => studioPanel.onSelectLayer(e.target.value)}
+                      >
+                        {visualLayersInScene.map((layer) => {
+                          const src = projectSources.find((s) => s.id === layer.sourceId);
+                          const tag =
+                            src?.kind === 'camera'
+                              ? 'Cámara'
+                              : src?.kind === 'window'
+                                ? 'Ventana'
+                                : src?.kind === 'screen'
+                                  ? 'Pantalla'
+                                  : src?.kind === 'image'
+                                    ? 'Imagen'
+                                    : src?.kind === 'video-file'
+                                      ? 'Video'
+                                      : src?.kind === 'text'
+                                        ? 'Texto'
+                                        : 'Fondo';
+                          return (
+                            <option key={layer.id} value={layer.id}>
+                              {layer.name} ({tag} · z:{layer.zIndex})
+                            </option>
+                          );
+                        })}
+                      </GlassSelect>
+                    )}
+
+                    {isDisplayTarget && activeEditableSource && (
+                      <GlassButton
+                        size="xs"
+                        className="w-full"
+                        variant={activeEditableRuntime?.status === 'live' ? 'regular' : 'primary'}
+                        onClick={() => studioPanel.onAuthorizeDisplaySource(activeEditableSource.id)}
+                        leadingIcon={<Monitor className="w-3.5 h-3.5" />}
+                      >
+                        {activeEditableRuntime?.status === 'live'
+                          ? 'Cambiar ventana o pantalla'
+                          : 'Compartir ventana o pantalla'}
+                      </GlassButton>
+                    )}
+
+                    {!isCameraTarget && (
+                      <p className="text-[10px] text-[var(--text-tertiary)] leading-snug">
+                        Editando «{activeEditableLayer.name}» con resolución original. Los filtros, enfoque e IA solo se aplican a la cámara física.
+                      </p>
+                    )}
+                  </div>
+
+                  <GlassDisclosure
+                    title="Transformación"
+                    subtitle="Posición, tamaño, rotación y composición"
+                    defaultOpen
+                    icon={<Move className="w-4 h-4 text-[var(--accent-blue)]" />}
+                    badge={
+                      <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)]">
+                        {activeEditableLayer.locked
+                          ? 'Bloqueada'
+                          : `${Math.round(editableLayerRect.width * 100)}×${Math.round(
+                              editableLayerRect.height * 100
+                            )}%`}
+                      </span>
+                    }
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <GlassButton
+                        size="xs"
+                        className="flex-1"
+                        variant={isEditableLayerSelected ? 'primary' : 'regular'}
+                        selected={isEditableLayerSelected}
+                        onClick={() =>
+                          studioPanel.onSelectLayer(
+                            isEditableLayerSelected ? null : activeEditableLayer.id
+                          )
+                        }
+                        leadingIcon={<Move className="w-3 h-3" />}
+                      >
+                        {isEditableLayerSelected ? 'Seleccionada en visor' : 'Editar en visor'}
+                      </GlassButton>
+                      <GlassIconButton
+                        size="sm"
+                        variant={activeEditableLayer.locked ? 'amber' : 'regular'}
+                        selected={activeEditableLayer.locked}
+                        label={
+                          activeEditableLayer.locked
+                            ? `Desbloquear ${activeEditableLayer.name}`
+                            : `Bloquear ${activeEditableLayer.name}`
+                        }
+                        onClick={() =>
+                          studioPanel.onToggleLayerLock(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            !activeEditableLayer.locked
+                          )
+                        }
+                      >
+                        {activeEditableLayer.locked ? (
+                          <Lock className="w-3.5 h-3.5" />
+                        ) : (
+                          <Unlock className="w-3.5 h-3.5" />
+                        )}
+                      </GlassIconButton>
+                    </div>
+
+                    <div className="grid grid-cols-4 gap-1">
+                      <GlassButton
+                        size="xs"
+                        title="Colocar inmediatamente detrás de la cámara"
+                        onClick={() =>
+                          studioPanel.onPlaceLayerBehindCamera?.(
+                            activeStudioScene.id,
+                            activeEditableLayer.id
+                          )
+                        }
+                      >
+                        Detrás
+                      </GlassButton>
+                      <GlassButton
+                        size="xs"
+                        title="Traer al frente"
+                        onClick={() =>
+                          studioPanel.onMoveLayerOrder?.(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            'top'
+                          )
+                        }
+                      >
+                        Frente
+                      </GlassButton>
+                      <GlassButton
+                        size="xs"
+                        title="Subir un nivel"
+                        onClick={() =>
+                          studioPanel.onMoveLayerOrder?.(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            'up'
+                          )
+                        }
+                      >
+                        Subir
+                      </GlassButton>
+                      <GlassButton
+                        size="xs"
+                        title="Bajar un nivel"
+                        onClick={() =>
+                          studioPanel.onMoveLayerOrder?.(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            'down'
+                          )
+                        }
+                      >
+                        Bajar
+                      </GlassButton>
+                    </div>
+                    {isDisplayTarget &&
+                      props.background.mode !== 'transparent' &&
+                      visualLayersInScene.some((camL) => {
+                        const camSrc = projectSources.find((s) => s.id === camL.sourceId);
+                        return (
+                          camSrc?.kind === 'camera' &&
+                          camL.visible &&
+                          camL.zIndex > activeEditableLayer.zIndex &&
+                          camL.transform.width >= 0.92 &&
+                          camL.transform.height >= 0.92 &&
+                          camL.style.opacity >= 0.98
+                        );
+                      }) && (
+                        <p className="text-[10px] text-[var(--accent-amber)] leading-snug">
+                          Detrás de cámara a pantalla completa · activa Transparencia IA o aplica una composición PiP.
+                        </p>
+                      )}
+
+                    <GlassSlider
+                      label="Tamaño libre de capa"
+                      min={8}
+                      max={100}
+                      step={1}
+                      disabled={activeEditableLayer.locked}
+                      value={Math.round(editableLayerRect.width * 100)}
+                      displayValue={`${Math.round(editableLayerRect.width * 100)}%`}
+                      onChange={(pct) => {
+                        const next = computeScaledLayerWidthTransform(
+                          activeEditableLayer.transform,
+                          pct / 100,
+                          {
+                            scene: activeStudioScene,
+                            layer: activeEditableLayer,
+                            sources: studioPanel.projectSources,
+                          }
+                        );
+                        studioPanel.onUpdateLayerTransform(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          next.transform,
+                          {
+                            preserveAspectK:
+                              next.transform.height / Math.max(0.01, next.transform.width),
+                            historyGroupKey: `layer-width-${activeEditableLayer.id}`,
+                            historyLabel: 'Escalar capa',
+                          }
+                        );
+                      }}
+                    />
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <GlassSlider
+                        label="Posición X"
+                        min={0}
+                        max={Math.max(0, Math.round((1 - editableLayerRect.width) * 100))}
+                        step={1}
+                        disabled={activeEditableLayer.locked || editableLayerRect.width >= 0.995}
+                        value={Math.round(editableLayerRect.left * 100)}
+                        displayValue={`${Math.round(editableLayerRect.left * 100)}%`}
+                        onChange={(leftPct) => {
+                          const next = rectToLayerTransform(
+                            {
+                              left: leftPct / 100,
+                              top: editableLayerRect.top,
+                              width: editableLayerRect.width,
+                              height: editableLayerRect.height,
+                            },
+                            activeEditableLayer.transform
+                          );
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            next,
+                            {
+                              historyGroupKey: `layer-x-${activeEditableLayer.id}`,
+                              historyLabel: 'Mover capa horizontalmente',
+                            }
+                          );
+                        }}
+                      />
+                      <GlassSlider
+                        label="Posición Y"
+                        min={0}
+                        max={Math.max(0, Math.round((1 - editableLayerRect.height) * 100))}
+                        step={1}
+                        disabled={activeEditableLayer.locked || editableLayerRect.height >= 0.995}
+                        value={Math.round(editableLayerRect.top * 100)}
+                        displayValue={`${Math.round(editableLayerRect.top * 100)}%`}
+                        onChange={(topPct) => {
+                          const next = rectToLayerTransform(
+                            {
+                              left: editableLayerRect.left,
+                              top: topPct / 100,
+                              width: editableLayerRect.width,
+                              height: editableLayerRect.height,
+                            },
+                            activeEditableLayer.transform
+                          );
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            next,
+                            {
+                              historyGroupKey: `layer-y-${activeEditableLayer.id}`,
+                              historyLabel: 'Mover capa verticalmente',
+                            }
+                          );
+                        }}
+                      />
+                    </div>
+
+                    <GlassSlider
+                      label="Rotación de capa"
+                      min={0}
+                      max={359}
+                      step={1}
+                      disabled={activeEditableLayer.locked}
+                      value={Math.round(
+                        ((activeEditableLayer.transform.rotationDeg % 360) + 360) % 360
+                      )}
+                      displayValue={`${Math.round(
+                        ((activeEditableLayer.transform.rotationDeg % 360) + 360) % 360
+                      )}°`}
+                      onReset={() =>
+                        studioPanel.onUpdateLayerTransform(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { rotationDeg: 0 }
+                        )
+                      }
+                      onChange={(deg) =>
+                        studioPanel.onUpdateLayerTransform(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { rotationDeg: deg },
+                          {
+                            historyGroupKey: `layer-rot-${activeEditableLayer.id}`,
+                            historyLabel: 'Rotar capa',
+                          }
+                        )
+                      }
+                    />
+
+                    <div className="grid grid-cols-3 gap-1.5">
+                      <GlassButton
+                        size="xs"
+                        disabled={activeEditableLayer.locked}
+                        selected={Boolean(activeEditableLayer.transform.flipH)}
+                        variant={activeEditableLayer.transform.flipH ? 'amber' : 'regular'}
+                        onClick={() =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { flipH: !activeEditableLayer.transform.flipH }
+                          )
+                        }
+                        leadingIcon={<FlipHorizontal className="w-3 h-3" />}
+                      >
+                        Espejo H
+                      </GlassButton>
+                      <GlassButton
+                        size="xs"
+                        disabled={activeEditableLayer.locked}
+                        selected={Boolean(activeEditableLayer.transform.flipV)}
+                        variant={activeEditableLayer.transform.flipV ? 'amber' : 'regular'}
+                        onClick={() =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { flipV: !activeEditableLayer.transform.flipV }
+                          )
+                        }
+                        leadingIcon={<FlipVertical className="w-3 h-3" />}
+                      >
+                        Volteo V
+                      </GlassButton>
+                      <GlassButton
+                        size="xs"
+                        disabled={activeEditableLayer.locked}
+                        onClick={() =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            {
+                              rotationDeg:
+                                (Math.round(activeEditableLayer.transform.rotationDeg) + 90) % 360,
+                            }
+                          )
+                        }
+                        leadingIcon={<RotateCw className="w-3 h-3" />}
+                      >
+                        +90°
+                      </GlassButton>
+                    </div>
+
+                    <div className="space-y-2 pt-1">
+                      <div className="text-[11px] font-medium text-[var(--text-secondary)]">
+                        Composición adaptable
+                      </div>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        {(
+                          [
+                            { id: 'corner-top-left', label: 'Sup. Izq' },
+                            { id: 'corner-top-right', label: 'Sup. Der' },
+                            { id: 'center', label: 'Centro' },
+                            { id: 'corner-bottom-left', label: 'Inf. Izq' },
+                            { id: 'corner-bottom-right', label: 'Inf. Der' },
+                            { id: 'camera-full', label: '100%' },
+                          ] as const satisfies ReadonlyArray<{
+                            id: AdaptableSceneLayoutId;
+                            label: string;
+                          }>
+                        ).map((layout) => (
+                          <GlassButton
+                            key={layout.id}
+                            size="xs"
+                            disabled={activeEditableLayer.locked}
+                            onClick={() =>
+                              studioPanel.onApplyAdaptableLayout?.(
+                                activeStudioScene.id,
+                                layout.id
+                              )
+                            }
+                          >
+                            {layout.label}
+                          </GlassButton>
+                        ))}
+                      </div>
+
+                      <div className="text-[10px] font-medium text-[var(--text-tertiary)] pt-1">
+                        Composición multicapa
+                      </div>
+                      {displayLayersInScene.length >= 2 && (
+                        <div className="grid grid-cols-2 gap-1.5 pb-1">
+                          <label className="space-y-0.5">
+                            <span className="text-[10px] text-[var(--text-tertiary)]">
+                              Principal
+                            </span>
+                            <GlassSelect
+                              aria-label="Pantalla o ventana principal para composición"
+                              value={resolvedPrimaryDisplayId}
+                              onChange={(e) => setCompPrimaryDisplayId(e.target.value)}
+                            >
+                              {displayLayersInScene.map((dl) => (
+                                <option key={`comp-pri-${dl.id}`} value={dl.id}>
+                                  {dl.name}
+                                </option>
+                              ))}
+                            </GlassSelect>
+                          </label>
+                          <label className="space-y-0.5">
+                            <span className="text-[10px] text-[var(--text-tertiary)]">
+                              Secundaria
+                            </span>
+                            <GlassSelect
+                              aria-label="Pantalla o ventana secundaria para composición"
+                              value={resolvedSecondaryDisplayId}
+                              onChange={(e) => setCompSecondaryDisplayId(e.target.value)}
+                            >
+                              {displayLayersInScene
+                                .filter((dl) => dl.id !== resolvedPrimaryDisplayId)
+                                .map((dl) => (
+                                  <option key={`comp-sec-${dl.id}`} value={dl.id}>
+                                    {dl.name}
+                                  </option>
+                                ))}
+                            </GlassSelect>
+                          </label>
+                        </div>
+                      )}
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {ADAPTABLE_COMPOSITIONS.map((comp) => (
+                          <GlassButton
+                            key={comp.id}
+                            size="xs"
+                            title={comp.description}
+                            onClick={() =>
+                              studioPanel.onApplyAdaptableLayout?.(
+                                activeStudioScene.id,
+                                comp.id,
+                                displayLayersInScene.length >= 2
+                                  ? {
+                                      primaryDisplayLayerId: resolvedPrimaryDisplayId || undefined,
+                                      secondaryDisplayLayerId:
+                                        resolvedSecondaryDisplayId || undefined,
+                                    }
+                                  : undefined
+                              )
+                            }
+                          >
+                            {comp.label}
+                          </GlassButton>
+                        ))}
+                      </div>
+                    </div>
+
+                    <p className="text-[10px] text-[var(--text-tertiary)] leading-snug">
+                      {activeEditableLayer.locked
+                        ? 'Capa bloqueada: desbloquea para mover, escalar o rotar.'
+                        : 'Escala libre hasta el 100% para cualquier capa visual sin reiniciar pistas. Flechas mueven · Esc deselecciona.'}
+                    </p>
+                  </GlassDisclosure>
+
+                  <GlassDisclosure
+                    title="Proporción"
+                    subtitle="Contenedor de capa independiente"
+                    defaultOpen={false}
+                    icon={<Maximize2 className="w-4 h-4 text-[var(--accent-blue)]" />}
+                    badge={
+                      <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)]">
+                        {editableAspectPreset === 'sensor'
+                          ? isCameraTarget
+                            ? 'Sensor'
+                            : 'Original'
+                          : editableAspectPreset === 'custom'
+                            ? `${(activeEditableLayer.transform.customAspectRatio ?? 1.78).toFixed(2)}:1`
+                            : editableAspectPreset}
+                      </span>
+                    }
+                  >
+                    <p className="text-[10px] text-[var(--text-tertiary)] leading-snug">
+                      Cambia el formato de «{activeEditableLayer.name}» sin deformar la fuente ni
+                      alterar ProgramCanvas ({studioPanel.outputWidth}×{studioPanel.outputHeight}).
+                    </p>
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {(
+                        [
+                          {
+                            id: 'sensor',
+                            label: isCameraTarget ? 'Sensor' : 'Original',
+                            box: 'w-4 h-2.5',
+                          },
+                          { id: '16:9', label: '16:9', box: 'w-4 h-2.5' },
+                          { id: '4:3', label: '4:3', box: 'w-3.5 h-2.5' },
+                          { id: '9:16', label: '9:16', box: 'w-2 h-3.5' },
+                          { id: '3:4', label: '3:4', box: 'w-2.5 h-3.5' },
+                          { id: '1:1', label: '1:1', box: 'w-3 h-3' },
+                          { id: 'custom', label: 'Pers.', box: 'w-3.5 h-3' },
+                        ] as const satisfies ReadonlyArray<{
+                          id: CameraAspectPreset;
+                          label: string;
+                          box: string;
+                        }>
+                      ).map((opt) => (
+                        <GlassButton
+                          key={opt.id}
+                          size="xs"
+                          disabled={activeEditableLayer.locked}
+                          selected={editableAspectPreset === opt.id}
+                          variant={editableAspectPreset === opt.id ? 'primary' : 'regular'}
+                          onClick={() => {
+                            const next = computeLayerAspectTransform(
+                              activeEditableLayer.transform,
+                              {
+                                scene: activeStudioScene,
+                                layer: activeEditableLayer,
+                                sources: studioPanel.projectSources,
+                                aspectPreset: opt.id,
+                                customAspectRatio:
+                                  activeEditableLayer.transform.customAspectRatio,
+                                intrinsicWidth: activeIntrinsicW,
+                                intrinsicHeight: activeIntrinsicH,
+                                outputWidth: studioPanel.outputWidth,
+                                outputHeight: studioPanel.outputHeight,
+                              }
+                            );
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              next.transform,
+                              {
+                                preserveAspectK:
+                                  next.transform.height / Math.max(0.01, next.transform.width),
+                              }
+                            );
+                          }}
+                          leadingIcon={
+                            <span
+                              aria-hidden="true"
+                              className={`inline-block rounded-[2px] border border-current/80 ${opt.box}`}
+                            />
+                          }
+                        >
+                          {opt.label}
+                        </GlassButton>
+                      ))}
+                    </div>
+
+                    {editableAspectPreset === 'custom' && (
+                      <GlassSlider
+                        label="Proporción personalizada"
+                        min={0.4}
+                        max={2.5}
+                        step={0.05}
+                        disabled={activeEditableLayer.locked}
+                        value={activeEditableLayer.transform.customAspectRatio ?? 1.78}
+                        displayValue={`${(
+                          activeEditableLayer.transform.customAspectRatio ?? 1.78
+                        ).toFixed(2)}:1`}
+                        onChange={(ratio) => {
+                          const next = computeLayerAspectTransform(
+                            activeEditableLayer.transform,
+                            {
+                              scene: activeStudioScene,
+                              layer: activeEditableLayer,
+                              sources: studioPanel.projectSources,
+                              aspectPreset: 'custom',
+                              customAspectRatio: ratio,
+                              intrinsicWidth: activeIntrinsicW,
+                              intrinsicHeight: activeIntrinsicH,
+                              outputWidth: studioPanel.outputWidth,
+                              outputHeight: studioPanel.outputHeight,
+                            }
+                          );
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            next.transform,
+                            {
+                              preserveAspectK:
+                                next.transform.height / Math.max(0.01, next.transform.width),
+                            }
+                          );
+                        }}
+                      />
+                    )}
+
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        disabled={activeEditableLayer.locked}
+                        onClick={() => {
+                          const next = computeProportionalLayerTransform(
+                            activeEditableLayer.transform,
+                            {
+                              scene: activeStudioScene,
+                              layer: activeEditableLayer,
+                              sources: studioPanel.projectSources,
+                              intrinsicWidth: activeIntrinsicW,
+                              intrinsicHeight: activeIntrinsicH,
+                              outputWidth: studioPanel.outputWidth,
+                              outputHeight: studioPanel.outputHeight,
+                            }
+                          );
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            next.transform,
+                            {
+                              preserveAspectK:
+                                next.transform.height / Math.max(0.01, next.transform.width),
+                            }
+                          );
+                        }}
+                        className="text-[11px] font-medium text-[var(--accent-blue)] hover:underline disabled:opacity-40 cursor-pointer inline-flex items-center gap-1"
+                      >
+                        <Maximize2 className="w-3 h-3" />
+                        {isCameraTarget
+                          ? 'Ajustar a proporción del sensor'
+                          : 'Ajustar a proporción original'}
+                      </button>
+                    </div>
+                  </GlassDisclosure>
+
+                  <GlassDisclosure
+                    title="Encuadre"
+                    subtitle="Recorte por bordes, zoom interno y desplazamiento"
+                    defaultOpen={isDisplayTarget}
+                    icon={<Crosshair className="w-4 h-4 text-[var(--accent-blue)]" />}
+                    badge={
+                      <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)]">
+                        {activeEditableLayer.transform.fitMode === 'contain' ? 'Contener' : 'Llenar'}{' '}
+                        · {(activeEditableLayer.transform.contentZoom ?? 1).toFixed(1)}×
+                      </span>
+                    }
+                  >
+                    <p className="text-[10px] text-[var(--text-tertiary)] leading-snug">
+                      Zoom interno escala solo el contenido dentro de esta capa (distinto de
+                      Tamaño libre y del Zoom Digital del visor).
+                    </p>
+
+                    <GlassSegmentedControl<'cover' | 'contain'>
+                      fullWidth
+                      size="xs"
+                      layoutGroupId="active-layer-fit-mode"
+                      ariaLabel="Modo de encuadre de la capa seleccionada"
+                      disabled={activeEditableLayer.locked}
+                      value={
+                        activeEditableLayer.transform.fitMode === 'contain' ? 'contain' : 'cover'
+                      }
+                      onChange={(mode) =>
+                        studioPanel.onUpdateLayerTransform(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { fitMode: mode }
+                        )
+                      }
+                      options={[
+                        { id: 'cover', label: 'Llenar (Cover)' },
+                        { id: 'contain', label: 'Todo (Contain)' },
+                      ]}
+                    />
+
+                    <GlassSlider
+                      label="Zoom interno de contenido"
+                      min={1}
+                      max={4}
+                      step={0.05}
+                      disabled={activeEditableLayer.locked}
+                      value={activeEditableLayer.transform.contentZoom ?? 1}
+                      displayValue={`${(activeEditableLayer.transform.contentZoom ?? 1).toFixed(2)}×`}
+                      onReset={() =>
+                        studioPanel.onUpdateLayerTransform(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { contentZoom: 1 }
+                        )
+                      }
+                      onChange={(contentZoom) =>
+                        studioPanel.onUpdateLayerTransform(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { contentZoom }
+                        )
+                      }
+                    />
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <GlassSlider
+                        label="Pan X"
+                        min={-100}
+                        max={100}
+                        step={1}
+                        disabled={activeEditableLayer.locked}
+                        value={Math.round((activeEditableLayer.transform.contentOffsetX ?? 0) * 100)}
+                        displayValue={`${Math.round(
+                          (activeEditableLayer.transform.contentOffsetX ?? 0) * 100
+                        )}%`}
+                        onReset={() =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { contentOffsetX: 0 }
+                          )
+                        }
+                        onChange={(pct) =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { contentOffsetX: pct / 100 }
+                          )
+                        }
+                      />
+                      <GlassSlider
+                        label="Pan Y"
+                        min={-100}
+                        max={100}
+                        step={1}
+                        disabled={activeEditableLayer.locked}
+                        value={Math.round((activeEditableLayer.transform.contentOffsetY ?? 0) * 100)}
+                        displayValue={`${Math.round(
+                          (activeEditableLayer.transform.contentOffsetY ?? 0) * 100
+                        )}%`}
+                        onReset={() =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { contentOffsetY: 0 }
+                          )
+                        }
+                        onChange={(pct) =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { contentOffsetY: pct / 100 }
+                          )
+                        }
+                      />
+                    </div>
+
+                    <div className="space-y-1.5 pt-1 border-t border-[var(--border-hairline)]">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="font-medium text-[var(--text-secondary)]">
+                          Recorte independiente por bordes
+                        </span>
+                        <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)]">
+                          {Math.round(editableCrop.top * 100)}·{Math.round(editableCrop.right * 100)}·
+                          {Math.round(editableCrop.bottom * 100)}·{Math.round(editableCrop.left * 100)}%
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <GlassSlider
+                          label="Recorte superior"
+                          min={0}
+                          max={49}
+                          step={1}
+                          disabled={activeEditableLayer.locked}
+                          value={Math.round(editableCrop.top * 100)}
+                          displayValue={`${Math.round(editableCrop.top * 100)}%`}
+                          onReset={() =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, top: 0 } }
+                            )
+                          }
+                          onChange={(pct) =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, top: pct / 100 } }
+                            )
+                          }
+                        />
+                        <GlassSlider
+                          label="Recorte inferior"
+                          min={0}
+                          max={49}
+                          step={1}
+                          disabled={activeEditableLayer.locked}
+                          value={Math.round(editableCrop.bottom * 100)}
+                          displayValue={`${Math.round(editableCrop.bottom * 100)}%`}
+                          onReset={() =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, bottom: 0 } }
+                            )
+                          }
+                          onChange={(pct) =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, bottom: pct / 100 } }
+                            )
+                          }
+                        />
+                        <GlassSlider
+                          label="Recorte izquierdo"
+                          min={0}
+                          max={49}
+                          step={1}
+                          disabled={activeEditableLayer.locked}
+                          value={Math.round(editableCrop.left * 100)}
+                          displayValue={`${Math.round(editableCrop.left * 100)}%`}
+                          onReset={() =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, left: 0 } }
+                            )
+                          }
+                          onChange={(pct) =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, left: pct / 100 } }
+                            )
+                          }
+                        />
+                        <GlassSlider
+                          label="Recorte derecho"
+                          min={0}
+                          max={49}
+                          step={1}
+                          disabled={activeEditableLayer.locked}
+                          value={Math.round(editableCrop.right * 100)}
+                          displayValue={`${Math.round(editableCrop.right * 100)}%`}
+                          onReset={() =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, right: 0 } }
+                            )
+                          }
+                          onChange={(pct) =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { ...editableCrop, right: pct / 100 } }
+                            )
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-end gap-3">
+                      {hasActiveCrop && (
+                        <button
+                          type="button"
+                          disabled={activeEditableLayer.locked}
+                          onClick={() =>
+                            studioPanel.onUpdateLayerTransform(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { crop: { top: 0, right: 0, bottom: 0, left: 0 } }
+                            )
+                          }
+                          className="text-[11px] font-medium text-[var(--accent-blue)] hover:underline disabled:opacity-40 cursor-pointer"
+                        >
+                          Restablecer recorte
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={activeEditableLayer.locked}
+                        onClick={() =>
+                          studioPanel.onUpdateLayerTransform(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { contentZoom: 1, contentOffsetX: 0, contentOffsetY: 0 }
+                          )
+                        }
+                        className="text-[11px] font-medium text-[var(--accent-blue)] hover:underline disabled:opacity-40 cursor-pointer inline-flex items-center gap-1"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        Centrar encuadre
+                      </button>
+                    </div>
+                  </GlassDisclosure>
+
+                  <GlassDisclosure
+                    title="Forma"
+                    subtitle="Máscara geométrica en tiempo real"
+                    defaultOpen
+                    icon={<Layers className="w-4 h-4 text-[var(--accent-blue)]" />}
+                    badge={
+                      <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)]">
+                        {maskShapeLabels[editableMaskShape]}
+                      </span>
+                    }
+                  >
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(
+                        [
+                          { id: 'rect', label: 'Rectángulo' },
+                          { id: 'square', label: 'Cuadrado' },
+                          { id: 'rounded', label: 'Redondeado' },
+                          { id: 'squircle', label: 'Squircle' },
+                          { id: 'circle', label: 'Círculo' },
+                          { id: 'ellipse', label: 'Elipse' },
+                        ] as const satisfies ReadonlyArray<{ id: LayerMaskShape; label: string }>
+                      ).map((shapeOpt) => (
+                        <GlassButton
+                          key={shapeOpt.id}
+                          size="xs"
+                          disabled={activeEditableLayer.locked}
+                          selected={editableMaskShape === shapeOpt.id}
+                          variant={editableMaskShape === shapeOpt.id ? 'primary' : 'regular'}
+                          onClick={() => {
+                            const patch: Partial<LayerStyle> = { maskShape: shapeOpt.id };
+                            if (
+                              (shapeOpt.id === 'rounded' || shapeOpt.id === 'squircle') &&
+                              activeEditableLayer.style.borderRadiusPx === 0
+                            ) {
+                              patch.borderRadiusPx = 28;
+                            }
+                            studioPanel.onUpdateLayerStyle?.(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              patch
+                            );
+                          }}
+                        >
+                          {shapeOpt.label}
+                        </GlassButton>
+                      ))}
+                    </div>
+
+                    {(editableMaskShape === 'rounded' ||
+                      editableMaskShape === 'squircle' ||
+                      editableMaskShape === 'square') && (
+                      <GlassSlider
+                        label="Radio de esquina"
+                        min={0}
+                        max={180}
+                        step={2}
+                        disabled={activeEditableLayer.locked}
+                        value={Math.round(activeEditableLayer.style.borderRadiusPx)}
+                        displayValue={`${Math.round(activeEditableLayer.style.borderRadiusPx)} px`}
+                        onReset={() =>
+                          studioPanel.onUpdateLayerStyle?.(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { borderRadiusPx: 28 }
+                          )
+                        }
+                        onChange={(borderRadiusPx) =>
+                          studioPanel.onUpdateLayerStyle?.(
+                            activeStudioScene.id,
+                            activeEditableLayer.id,
+                            { borderRadiusPx },
+                            {
+                              historyGroupKey: `style-radius-${activeEditableLayer.id}`,
+                              historyLabel: 'Ajustar radio de esquina',
+                            }
+                          )
+                        }
+                      />
+                    )}
+                  </GlassDisclosure>
+
+                  <GlassDisclosure
+                    title="Apariencia"
+                    subtitle="Opacidad, borde y sombra difuminada"
+                    defaultOpen={false}
+                    icon={<Palette className="w-4 h-4 text-[var(--accent-blue)]" />}
+                    badge={
+                      <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)]">
+                        {Math.round(activeEditableLayer.style.opacity * 100)}%
+                      </span>
+                    }
+                  >
+                    <GlassSlider
+                      label="Opacidad global"
+                      min={0}
+                      max={100}
+                      step={1}
+                      disabled={activeEditableLayer.locked}
+                      value={Math.round(activeEditableLayer.style.opacity * 100)}
+                      displayValue={`${Math.round(activeEditableLayer.style.opacity * 100)}%`}
+                      onReset={() =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { opacity: 1 }
+                        )
+                      }
+                      onChange={(pct) =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { opacity: pct / 100 },
+                          {
+                            historyGroupKey: `style-opacity-${activeEditableLayer.id}`,
+                            historyLabel: 'Ajustar opacidad de capa',
+                          }
+                        )
+                      }
+                    />
+
+                    <GlassToggle
+                      label="Borde visible"
+                      description="Se aplica sin reiniciar fuentes y respeta la forma activa"
+                      checked={editableBorderEnabled}
+                      disabled={activeEditableLayer.locked}
+                      onChange={(enabled) =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          enabled
+                            ? {
+                                borderEnabled: true,
+                                borderWidthPx: Math.max(
+                                  4,
+                                  activeEditableLayer.style.borderWidthPx || 0
+                                ),
+                              }
+                            : { borderEnabled: false }
+                        )
+                      }
+                    />
+
+                    {editableBorderEnabled && (
+                      <>
+                        <GlassSlider
+                          label="Grosor del borde"
+                          min={1}
+                          max={24}
+                          step={1}
+                          disabled={activeEditableLayer.locked}
+                          value={Math.max(
+                            1,
+                            Math.round(activeEditableLayer.style.borderWidthPx)
+                          )}
+                          displayValue={`${Math.max(
+                            1,
+                            Math.round(activeEditableLayer.style.borderWidthPx)
+                          )} px`}
+                          onChange={(borderWidthPx) =>
+                            studioPanel.onUpdateLayerStyle?.(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { borderEnabled: true, borderWidthPx }
+                            )
+                          }
+                        />
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs text-[var(--text-secondary)]">Color de borde</span>
+                          <div className="flex items-center gap-1.5">
+                            {['#FFFFFF', '#0A84FF', '#30D158', '#FF9F0A', '#FF453A', '#000000'].map(
+                              (hex) => (
+                                <button
+                                  key={hex}
+                                  type="button"
+                                  disabled={activeEditableLayer.locked}
+                                  aria-label={`Color de borde ${hex}`}
+                                  onClick={() =>
+                                    studioPanel.onUpdateLayerStyle?.(
+                                      activeStudioScene.id,
+                                      activeEditableLayer.id,
+                                      { borderColor: hex, borderEnabled: true }
+                                    )
+                                  }
+                                  className={`w-5 h-5 rounded-full border transition-transform cursor-pointer ${
+                                    activeEditableLayer.style.borderColor.toUpperCase() === hex
+                                      ? 'scale-110 ring-2 ring-[var(--accent-blue)] border-white'
+                                      : 'border-white/30'
+                                  }`}
+                                  style={{ backgroundColor: hex }}
+                                />
+                              )
+                            )}
+                            <input
+                              type="color"
+                              aria-label="Selector personalizado de color de borde"
+                              disabled={activeEditableLayer.locked}
+                              value={activeEditableLayer.style.borderColor}
+                              onChange={(e) =>
+                                studioPanel.onUpdateLayerStyle?.(
+                                  activeStudioScene.id,
+                                  activeEditableLayer.id,
+                                  { borderColor: e.target.value, borderEnabled: true }
+                                )
+                              }
+                              className="w-6 h-6 rounded-full bg-transparent cursor-pointer border border-white/25"
+                            />
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    <GlassSlider
+                      label="Sombra difuminada"
+                      min={0}
+                      max={96}
+                      step={2}
+                      disabled={activeEditableLayer.locked}
+                      value={Math.round(activeEditableLayer.style.shadowBlurPx)}
+                      displayValue={`${Math.round(activeEditableLayer.style.shadowBlurPx)} px`}
+                      onReset={() =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { shadowBlurPx: 24, shadowOpacity: 0.35 }
+                        )
+                      }
+                      onChange={(shadowBlurPx) =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { shadowBlurPx }
+                        )
+                      }
+                    />
+
+                    <GlassSlider
+                      label="Opacidad de sombra"
+                      min={0}
+                      max={100}
+                      step={1}
+                      disabled={
+                        activeEditableLayer.locked || activeEditableLayer.style.shadowBlurPx <= 0
+                      }
+                      value={Math.round(activeEditableLayer.style.shadowOpacity * 100)}
+                      displayValue={`${Math.round(
+                        activeEditableLayer.style.shadowOpacity * 100
+                      )}%`}
+                      onChange={(pct) =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { shadowOpacity: pct / 100 }
+                        )
+                      }
+                    />
+
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-[var(--text-secondary)]">Color de sombra</span>
+                      <div className="flex items-center gap-1.5">
+                        {['#000000', '#0F172A', '#1E3A8A', '#FFFFFF'].map((hex) => (
+                          <button
+                            key={hex}
+                            type="button"
+                            disabled={activeEditableLayer.locked}
+                            aria-label={`Color de sombra ${hex}`}
+                            onClick={() =>
+                              studioPanel.onUpdateLayerStyle?.(
+                                activeStudioScene.id,
+                                activeEditableLayer.id,
+                                { shadowColor: hex }
+                              )
+                            }
+                            className={`w-5 h-5 rounded-full border transition-transform cursor-pointer ${
+                              activeEditableLayer.style.shadowColor.toUpperCase() === hex
+                                ? 'scale-110 ring-2 ring-[var(--accent-blue)] border-white'
+                                : 'border-white/30'
+                            }`}
+                            style={{ backgroundColor: hex }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </GlassDisclosure>
+
+                  <GlassDisclosure
+                    title="Integración alfa"
+                    subtitle="Difuminado perimetral sin halos"
+                    defaultOpen={false}
+                    icon={<Wand2 className="w-4 h-4 text-[var(--accent-blue)]" />}
+                    badge={
+                      <span className="font-mono tabular-nums text-[10px] text-[var(--text-tertiary)]">
+                        {Math.round(editableFeatherPx)} px
+                      </span>
+                    }
+                  >
+                    <GlassSlider
+                      label="Difuminado perimetral"
+                      min={0}
+                      max={140}
+                      step={1}
+                      disabled={activeEditableLayer.locked}
+                      value={Math.round(editableFeatherPx)}
+                      displayValue={`${Math.round(editableFeatherPx)} px`}
+                      onReset={() =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { featherPx: 0 }
+                        )
+                      }
+                      onChange={(featherPx) =>
+                        studioPanel.onUpdateLayerStyle?.(
+                          activeStudioScene.id,
+                          activeEditableLayer.id,
+                          { featherPx }
+                        )
+                      }
+                    />
+
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] text-[var(--text-tertiary)] leading-snug">
+                        Alfa recto hacia el interior en todas las formas, sin borde obligatorio y
+                        aplicable a cámara, ventana, pantalla o imagen.
+                      </span>
+                      {editableFeatherPx > 0 && (
+                        <button
+                          type="button"
+                          disabled={activeEditableLayer.locked}
+                          onClick={() =>
+                            studioPanel.onUpdateLayerStyle?.(
+                              activeStudioScene.id,
+                              activeEditableLayer.id,
+                              { featherPx: 0 }
+                            )
+                          }
+                          className="text-[11px] font-medium text-[var(--accent-blue)] hover:underline shrink-0 cursor-pointer"
+                        >
+                          Quitar
+                        </button>
+                      )}
+                    </div>
+                  </GlassDisclosure>
+                </>
+              )}
+
             <GlassDisclosure
-              title="Zoom Digital"
-              defaultOpen
+              title={
+                studioPanel?.engineMode === 'studio'
+                  ? 'Zoom Digital del visor'
+                  : 'Zoom Digital'
+              }
+              subtitle={
+                studioPanel?.engineMode === 'studio'
+                  ? 'Ampliación global de cámara física'
+                  : undefined
+              }
+              defaultOpen={studioPanel?.engineMode !== 'studio'}
               badge={
                 <span className="font-mono tabular-nums text-[11px] font-semibold text-[var(--accent-blue)]">
                   {props.zoom.toFixed(1)}×
@@ -442,7 +1928,7 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
               }
             >
               <GlassSlider
-                label="Ampliación óptica digital"
+                label="Ampliación digital del visor"
                 min={1}
                 max={4}
                 step={0.1}
@@ -650,7 +2136,7 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
                 </div>
 
                 <GlassToggle
-                  label="Marco de seguimiento IA en visor"
+                  label="Reconocer sujetos con IA"
                   subtle
                   checked={props.focus.aiTrackingEnabled}
                   onChange={(aiTrackingEnabled) =>
@@ -1322,22 +2808,29 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
             >
               <div className="flex items-center justify-between text-[11px] py-0.5">
                 <span className="font-mono text-[var(--text-tertiary)] truncate">
-                  {props.background.useAi
-                    ? props.aiStatus.segmenter === 'loading'
-                      ? 'Cargando red neuronal...'
-                      : props.aiStatus.segmenter === 'error'
+                  {props.background.mode === 'transparent'
+                    ? props.aiStatus.segmenter === 'error'
+                      ? 'Recorte no disponible · cámara original'
+                      : props.aiStatus.segmenter === 'loading' || props.aiStatus.segmenter === 'idle'
+                        ? 'Preparando recorte · cámara original'
+                        : 'Modelo IA listo'
+                    : props.background.useAi
+                      ? props.aiStatus.segmenter === 'error'
                         ? 'Respaldo cromático activo'
-                        : 'IA Neural MediaPipe activa'
-                    : 'Modo cromático manual'}
+                        : props.aiStatus.segmenter === 'ready'
+                          ? 'Modelo MediaPipe listo'
+                          : 'Preparando red neuronal...'
+                      : 'Modo cromático manual'}
                 </span>
                 <button
                   type="button"
+                  disabled={props.background.mode === 'transparent'}
                   onClick={() =>
                     props.onChangeBackground((p) => ({ ...p, useAi: !p.useAi }))
                   }
                   className="text-[var(--accent-blue)] hover:underline font-medium whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  {props.background.useAi ? 'Usar Color' : 'Usar IA'}
+                  {props.background.mode === 'transparent' ? 'IA requerida' : props.background.useAi ? 'Usar Color' : 'Usar IA'}
                 </button>
               </div>
 
@@ -1347,7 +2840,7 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
                 layoutGroupId="inspector-bg-mode"
                 ariaLabel="Modo de reemplazo de fondo"
                 value={props.background.mode}
-                onChange={(mode) => props.onChangeBackground((p) => ({ ...p, mode }))}
+                onChange={(mode) => props.onChangeBackground((p) => ({ ...p, mode, useAi: mode === 'transparent' ? true : p.useAi }))}
                 options={[
                   { id: 'none', label: 'Original' },
                   { id: 'blur', label: 'Desenfoque' },
@@ -1355,6 +2848,19 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
                   { id: 'image', label: 'Imagen' },
                 ]}
               />
+              {studioPanel?.engineMode === 'studio' && (
+                <GlassButton size="sm" className="w-full"
+                  onClick={() => props.onChangeBackground((p) => ({ ...p, mode: p.mode === 'transparent' ? 'none' : 'transparent', useAi: true }))}>
+                  {props.background.mode === 'transparent' ? 'Restaurar fondo original' : 'Quitar fondo · Transparente'}
+                </GlassButton>
+              )}
+              {props.background.mode === 'transparent' && (
+                <p className="text-[11px] text-[var(--text-tertiary)]">
+                  {studioPanel?.engineMode !== 'studio'
+                    ? 'La transparencia requiere el motor Studio. Se conserva la cámara original.'
+                    : 'Compone sobre las capas inferiores. Si falla la IA, vuelve a la cámara original. Los efectos geométricos se suspenden durante el recorte.'}
+                </p>
+              )}
 
               {props.background.mode === 'image' && (
                 <div className="space-y-2.5">
@@ -1511,7 +3017,7 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
                     }
                   />
 
-                  {!props.background.useAi && (
+                  {!props.background.useAi && props.background.mode !== 'transparent' && (
                     <div className="flex items-center gap-2 pt-0.5">
                       <GlassButton
                         size="xs"
@@ -2188,7 +3694,7 @@ export const SidebarControls: React.FC<SidebarControlsProps> = (props) => {
                         variant={
                           props.studioEnginePanel.hasLiveDisplaySource ? 'amber' : 'primary'
                         }
-                        onClick={props.studioEnginePanel.onAuthorizeDisplaySource}
+                        onClick={() => props.studioEnginePanel?.onAuthorizeDisplaySource()}
                       >
                         {props.studioEnginePanel.hasLiveDisplaySource
                           ? 'Cambiar pantalla o ventana'

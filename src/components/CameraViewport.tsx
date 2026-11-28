@@ -1,9 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AppWindow,
   Camera,
+  ChevronsDown,
+  ChevronsUp,
   Crosshair,
+  EyeOff,
   FlipHorizontal,
   Focus,
+  Lock,
   Maximize2,
   Minimize2,
   Monitor,
@@ -11,15 +16,17 @@ import {
   Pause,
   PictureInPicture2,
   Play,
+  Plus,
+  RefreshCw,
   RotateCcw,
   RotateCw,
   Snowflake,
   Square,
+  Unlock,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import type {
-  AiSubjectBox,
   AiVisionStatus,
   AspectRatioId,
   CapturedMediaItem,
@@ -36,14 +43,77 @@ import type {
   VisualEffectId,
 } from '../types/camera';
 import { renderFocusPeakingOverlay } from '../utils/canvasProcessor';
+import type {
+  LayerTransform,
+  StudioScene,
+  StudioSource,
+} from '../types/studio';
+import {
+  computeLayerCornerResizeTransform,
+  computeLayerDragTransform,
+  findPrimaryVisualLayer,
+  getLayerNormalizedRect,
+  hitTestSceneLayerAtPoint,
+  isVisualSourceEditable,
+  type ResizeHandleId,
+  type SnapGuide,
+} from '../engine/layerEditor';
 import {
   GlassButton,
   GlassContextMenu,
   GlassIconButton,
   GlassStatusIndicator,
   GlassTooltip,
+  glassMaterialClass,
   type ContextMenuItem,
 } from './glass';
+
+export interface StudioLayerEditorProps {
+  enabled: boolean;
+  activeScene: StudioScene | null;
+  sources: StudioSource[];
+  selectedLayerId: string | null;
+  onSelectLayer: (layerId: string | null) => void;
+  onUpdateLayerTransform: (
+    sceneId: string,
+    layerId: string,
+    transformPatch: Partial<LayerTransform>,
+    options?: { preserveAspectK?: number }
+  ) => void;
+  onToggleLayerLock: (sceneId: string, layerId: string, locked: boolean) => void;
+  onBeginLayerEdit?: (label: string) => void;
+  onCommitLayerEdit?: () => void;
+  onMoveLayerOrder?: (
+    sceneId: string,
+    layerId: string,
+    direction: 'up' | 'down' | 'top' | 'bottom'
+  ) => void;
+  onToggleLayerVisible?: (sceneId: string, layerId: string, visible: boolean) => void;
+  onResetLayerTransform?: (sceneId: string, layerId: string) => void;
+}
+
+export interface StudioDisplayPopoverProps {
+  enabled: boolean;
+  activeScene: StudioScene | null;
+  sources: StudioSource[];
+  runtimeSources: Array<{
+    id: string;
+    name: string;
+    kind: StudioSource['kind'];
+    status: string;
+  }>;
+  layerDiagnostics?: Array<{
+    layerId: string;
+    intrinsicWidth: number;
+    intrinsicHeight: number;
+  }>;
+  selectedLayerId: string | null;
+  onSelectOrAddDisplayLayer: (sourceId: string) => void;
+  onChangeDisplayCapture: (sourceId: string) => void;
+  onAddDisplaySource: (kind: 'screen' | 'window') => void;
+  onPlaceLayerBehindCamera: (layerId: string) => void;
+  onMoveLayerToTop: (layerId: string) => void;
+}
 
 interface CameraViewportProps {
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
@@ -103,11 +173,12 @@ interface CameraViewportProps {
   isDualCamActive: boolean;
   isOutputPipActive: boolean;
   onToggleOutputPip: () => void;
-  detectedSubjects: AiSubjectBox[];
   aiStatus: { segmenter: AiVisionStatus; detector: AiVisionStatus };
   cinemaMode?: boolean;
   onToggleCinemaMode?: () => void;
   hiddenForGallery?: boolean;
+  studioLayerEditor?: StudioLayerEditorProps;
+  studioDisplayPopover?: StudioDisplayPopoverProps;
 }
 
 function formatDuration(sec: number): string {
@@ -172,26 +243,63 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
   isDualCamActive,
   isOutputPipActive,
   onToggleOutputPip,
-  detectedSubjects,
   aiStatus,
   cinemaMode = false,
   onToggleCinemaMode,
   hiddenForGallery = false,
+  studioLayerEditor,
+  studioDisplayPopover,
 }) => {
   const outerStageRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const peakingCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const prompterScrollRef = useRef<HTMLDivElement | null>(null);
+  const shareDisplayBtnRef = useRef<HTMLButtonElement | null>(null);
+  const displayPopoverRef = useRef<HTMLDivElement | null>(null);
+  const [displayPopoverOpen, setDisplayPopoverOpen] = useState(false);
   const [stageBounds, setStageBounds] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
   const [isDraggingPan, setIsDraggingPan] = useState(false);
   const dragStartRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const [draggingSplit, setDraggingSplit] = useState(false);
   const [focusPulseKey, setFocusPulseKey] = useState(0);
+  const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
+  const [activeLayerEditMode, setActiveLayerEditMode] = useState<'drag' | 'resize' | null>(null);
+  const layerInteractionRef = useRef<{
+    mode: 'drag' | 'resize';
+    handle?: ResizeHandleId;
+    sceneId: string;
+    layer: NonNullable<ReturnType<typeof findPrimaryVisualLayer>>;
+    startTransform: LayerTransform;
+    startPointerNormX: number;
+    startPointerNormY: number;
+  } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ open: boolean; x: number; y: number }>({
     open: false,
     x: 0,
     y: 0,
   });
+
+  useEffect(() => {
+    if (!displayPopoverOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        setDisplayPopoverOpen(false);
+      }
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (displayPopoverRef.current?.contains(target)) return;
+      if (shareDisplayBtnRef.current?.contains(target)) return;
+      setDisplayPopoverOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('mousedown', onMouseDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('mousedown', onMouseDown);
+    };
+  }, [displayPopoverOpen]);
 
   useEffect(() => {
     const el = outerStageRef.current;
@@ -278,10 +386,82 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
       return;
     }
 
+    if (
+      studioLayerEditor?.enabled &&
+      !cinemaMode &&
+      studioLayerEditor.activeScene
+    ) {
+      const hitLayer = hitTestSceneLayerAtPoint(
+        studioLayerEditor.activeScene,
+        studioLayerEditor.sources,
+        normX,
+        normY
+      );
+      if (hitLayer) {
+        studioLayerEditor.onSelectLayer(hitLayer.id);
+        if (!hitLayer.locked && zoom <= 1.01) {
+          studioLayerEditor.onBeginLayerEdit?.('Mover capa');
+          layerInteractionRef.current = {
+            mode: 'drag',
+            sceneId: studioLayerEditor.activeScene.id,
+            layer: hitLayer,
+            startTransform: hitLayer.transform,
+            startPointerNormX: normX,
+            startPointerNormY: normY,
+          };
+          setActiveLayerEditMode('drag');
+          e.currentTarget.setPointerCapture(e.pointerId);
+          return;
+        }
+        if (zoom <= 1.01) {
+          return;
+        }
+      } else if (studioLayerEditor.selectedLayerId !== null) {
+        studioLayerEditor.onSelectLayer(null);
+      }
+    }
+
     if (zoom > 1.01) {
       setIsDraggingPan(true);
       dragStartRef.current = { x: e.clientX, y: e.clientY, panX, panY };
       e.currentTarget.setPointerCapture(e.pointerId);
+    }
+  };
+
+  const handleResizeHandlePointerDown = (
+    handle: ResizeHandleId,
+    e: React.PointerEvent<HTMLButtonElement>
+  ) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    if (
+      !studioLayerEditor?.enabled ||
+      cinemaMode ||
+      !studioLayerEditor.activeScene ||
+      !selectedVisualLayer ||
+      selectedVisualLayer.locked
+    ) {
+      return;
+    }
+    const rect = stageRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const normY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    studioLayerEditor.onBeginLayerEdit?.('Redimensionar capa');
+    layerInteractionRef.current = {
+      mode: 'resize',
+      handle,
+      sceneId: studioLayerEditor.activeScene.id,
+      layer: selectedVisualLayer,
+      startTransform: selectedVisualLayer.transform,
+      startPointerNormX: normX,
+      startPointerNormY: normY,
+    };
+    setActiveLayerEditMode('resize');
+    try {
+      stageRef.current?.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore if capture is unsupported
     }
   };
 
@@ -292,6 +472,57 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
     if (draggingSplit) {
       const normX = Math.max(0.05, Math.min(0.95, (e.clientX - rect.left) / rect.width));
       onChangeAbSplitPosition(normX);
+      return;
+    }
+
+    if (layerInteractionRef.current && studioLayerEditor?.enabled) {
+      const interaction = layerInteractionRef.current;
+      const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const normY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+      const enableSnap = !e.altKey;
+
+      if (interaction.mode === 'drag') {
+        const res = computeLayerDragTransform(
+          interaction.startTransform,
+          normX - interaction.startPointerNormX,
+          normY - interaction.startPointerNormY,
+          {
+            scene: studioLayerEditor.activeScene,
+            layer: interaction.layer,
+            sources: studioLayerEditor.sources,
+            enableSnap,
+          }
+        );
+        setSnapGuides(res.activeGuides);
+        studioLayerEditor.onUpdateLayerTransform(
+          interaction.sceneId,
+          interaction.layer.id,
+          res.transform
+        );
+      } else if (interaction.mode === 'resize' && interaction.handle) {
+        const res = computeLayerCornerResizeTransform(
+          interaction.startTransform,
+          interaction.handle,
+          normX,
+          normY,
+          {
+            scene: studioLayerEditor.activeScene,
+            layer: interaction.layer,
+            sources: studioLayerEditor.sources,
+            enableSnap,
+          }
+        );
+        setSnapGuides(res.activeGuides);
+        studioLayerEditor.onUpdateLayerTransform(
+          interaction.sceneId,
+          interaction.layer.id,
+          res.transform,
+          {
+            preserveAspectK:
+              res.transform.height / Math.max(0.01, res.transform.width),
+          }
+        );
+      }
       return;
     }
 
@@ -307,12 +538,31 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
   const handleViewportPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (draggingSplit) {
       setDraggingSplit(false);
-      e.currentTarget.releasePointerCapture(e.pointerId);
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        // Ignore
+      }
+    }
+    if (layerInteractionRef.current) {
+      layerInteractionRef.current = null;
+      setActiveLayerEditMode(null);
+      setSnapGuides([]);
+      studioLayerEditor?.onCommitLayerEdit?.();
+      try {
+        stageRef.current?.releasePointerCapture(e.pointerId);
+      } catch {
+        // Ignore
+      }
     }
     if (isDraggingPan) {
       setIsDraggingPan(false);
       dragStartRef.current = null;
-      e.currentTarget.releasePointerCapture(e.pointerId);
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        // Ignore
+      }
     }
   };
 
@@ -360,6 +610,33 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
   const reticleSizePx =
     focus.areaSize === 'spot' ? 56 : focus.areaSize === 'zone' ? 104 : 164;
 
+  const primaryVisualLayer =
+    studioLayerEditor?.enabled && studioLayerEditor.activeScene
+      ? findPrimaryVisualLayer(studioLayerEditor.activeScene, studioLayerEditor.sources)
+      : null;
+
+  const selectedVisualLayer =
+    studioLayerEditor?.enabled &&
+    !cinemaMode &&
+    !hiddenForGallery &&
+    studioLayerEditor.activeScene &&
+    studioLayerEditor.selectedLayerId
+      ? studioLayerEditor.activeScene.layers.find(
+          (l) =>
+            l.id === studioLayerEditor.selectedLayerId &&
+            l.visible &&
+            isVisualSourceEditable(
+              studioLayerEditor.sources.find((s) => s.id === l.sourceId)
+            )
+        ) ?? null
+      : null;
+
+  const selectedLayerRect = selectedVisualLayer
+    ? getLayerNormalizedRect(selectedVisualLayer.transform)
+    : null;
+
+  const targetContextLayer = selectedVisualLayer ?? primaryVisualLayer;
+
   const showFocusReticle =
     focus.selectingArea || focus.mode === 'manual' || focus.apertureBlur > 0;
 
@@ -371,6 +648,97 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
       icon: <Camera className="w-3.5 h-3.5" />,
       onSelect: onCapturePhoto,
     },
+    ...(studioLayerEditor?.enabled && studioLayerEditor.activeScene && targetContextLayer
+      ? [
+          {
+            id: 'ctx-select-visual-layer',
+            label:
+              selectedVisualLayer?.id === targetContextLayer.id
+                ? `Deseleccionar capa (${targetContextLayer.name})`
+                : `Editar capa (${targetContextLayer.name})`,
+            icon: <Move className="w-3.5 h-3.5" />,
+            onSelect: () =>
+              studioLayerEditor.onSelectLayer(
+                selectedVisualLayer?.id === targetContextLayer.id
+                  ? null
+                  : targetContextLayer.id
+              ),
+          },
+          {
+            id: 'ctx-lock-visual-layer',
+            label: targetContextLayer.locked
+              ? `Desbloquear ${targetContextLayer.name}`
+              : `Bloquear ${targetContextLayer.name}`,
+            icon: targetContextLayer.locked ? (
+              <Unlock className="w-3.5 h-3.5" />
+            ) : (
+              <Lock className="w-3.5 h-3.5" />
+            ),
+            onSelect: () =>
+              studioLayerEditor.onToggleLayerLock(
+                studioLayerEditor.activeScene!.id,
+                targetContextLayer.id,
+                !targetContextLayer.locked
+              ),
+          },
+          ...(studioLayerEditor.onMoveLayerOrder
+            ? [
+                {
+                  id: 'ctx-bring-front',
+                  label: `Traer al frente (${targetContextLayer.name})`,
+                  icon: <ChevronsUp className="w-3.5 h-3.5" />,
+                  onSelect: () =>
+                    studioLayerEditor.onMoveLayerOrder?.(
+                      studioLayerEditor.activeScene!.id,
+                      targetContextLayer.id,
+                      'top'
+                    ),
+                },
+                {
+                  id: 'ctx-send-back',
+                  label: `Enviar al fondo (${targetContextLayer.name})`,
+                  icon: <ChevronsDown className="w-3.5 h-3.5" />,
+                  onSelect: () =>
+                    studioLayerEditor.onMoveLayerOrder?.(
+                      studioLayerEditor.activeScene!.id,
+                      targetContextLayer.id,
+                      'bottom'
+                    ),
+                },
+              ]
+            : []),
+          ...(studioLayerEditor.onToggleLayerVisible
+            ? [
+                {
+                  id: 'ctx-hide-layer',
+                  label: `Ocultar ${targetContextLayer.name}`,
+                  icon: <EyeOff className="w-3.5 h-3.5" />,
+                  onSelect: () =>
+                    studioLayerEditor.onToggleLayerVisible?.(
+                      studioLayerEditor.activeScene!.id,
+                      targetContextLayer.id,
+                      false
+                    ),
+                },
+              ]
+            : []),
+          ...(studioLayerEditor.onResetLayerTransform
+            ? [
+                {
+                  id: 'ctx-reset-layer-transform',
+                  label: 'Restablecer transformación',
+                  disabled: targetContextLayer.locked,
+                  icon: <RotateCcw className="w-3.5 h-3.5" />,
+                  onSelect: () =>
+                    studioLayerEditor.onResetLayerTransform?.(
+                      studioLayerEditor.activeScene!.id,
+                      targetContextLayer.id
+                    ),
+                },
+              ]
+            : []),
+        ]
+      : []),
     {
       id: 'ctx-mirror',
       label: mirror ? 'Desactivar espejo' : 'Espejo horizontal',
@@ -453,6 +821,7 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
             onPointerDown={handleViewportPointerDown}
             onPointerMove={handleViewportPointerMove}
             onPointerUp={handleViewportPointerUp}
+            onPointerCancel={handleViewportPointerUp}
             onWheel={handleWheelZoom}
             onContextMenu={(e) => {
               e.preventDefault();
@@ -466,14 +835,161 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
             className={`relative bg-black rounded-2xl overflow-hidden border border-[var(--studio-stage-frame-border)] shadow-[0_18px_48px_-14px_rgba(0,0,0,0.68)] select-none shrink-0 ${
               eyedropperActive || focus.selectingArea
                 ? 'cursor-crosshair'
-                : zoom > 1
-                  ? isDraggingPan
-                    ? 'cursor-grabbing'
-                    : 'cursor-grab'
-                  : 'cursor-default'
+                : activeLayerEditMode === 'drag'
+                  ? 'cursor-grabbing'
+                  : zoom > 1
+                    ? isDraggingPan
+                      ? 'cursor-grabbing'
+                      : 'cursor-grab'
+                    : 'cursor-default'
             }`}
           >
             <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block" />
+
+            {/* Guías visuales de alineación y marco interactivo de capa de cámara (solo UI, excluidos de ProgramCanvas) */}
+            {snapGuides.length > 0 && !cinemaMode && (
+              <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-10">
+                {snapGuides.map((g, idx) =>
+                  g.axis === 'x' ? (
+                    <div
+                      key={`gx-${idx}-${g.position}`}
+                      className={`absolute inset-y-0 w-px ${
+                        g.kind === 'center' ? 'bg-amber-400/90' : 'bg-sky-400/85'
+                      }`}
+                      style={{ left: `${g.position * 100}%` }}
+                    />
+                  ) : (
+                    <div
+                      key={`gy-${idx}-${g.position}`}
+                      className={`absolute inset-x-0 h-px ${
+                        g.kind === 'center' ? 'bg-amber-400/90' : 'bg-sky-400/85'
+                      }`}
+                      style={{ top: `${g.position * 100}%` }}
+                    />
+                  )
+                )}
+              </div>
+            )}
+
+            {selectedVisualLayer && selectedLayerRect && studioLayerEditor?.activeScene && (
+              <div
+                aria-label={`Capa seleccionada: ${selectedVisualLayer.name}`}
+                className={`pointer-events-none absolute z-10 border-[1.5px] transition-colors ${
+                  selectedVisualLayer.style.maskShape === 'circle' ||
+                  selectedVisualLayer.style.maskShape === 'ellipse'
+                    ? 'rounded-full'
+                    : selectedVisualLayer.style.maskShape === 'rounded' ||
+                        selectedVisualLayer.style.maskShape === 'squircle'
+                      ? 'rounded-2xl'
+                      : 'rounded-sm'
+                } ${
+                  selectedVisualLayer.locked
+                    ? 'border-amber-400/90 shadow-[0_0_0_1px_rgba(0,0,0,0.45)]'
+                    : 'border-sky-400/95 shadow-[0_0_0_1px_rgba(0,0,0,0.45)]'
+                }`}
+                style={{
+                  left: `${selectedLayerRect.left * 100}%`,
+                  top: `${selectedLayerRect.top * 100}%`,
+                  width: `${selectedLayerRect.width * 100}%`,
+                  height: `${selectedLayerRect.height * 100}%`,
+                }}
+              >
+                <div
+                  className={`pointer-events-auto glass-clear absolute left-1.5 flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono tabular-nums text-white max-w-[calc(100%-0.75rem)] ${
+                    selectedLayerRect.top < 0.08 ? 'top-1.5' : '-top-7'
+                  }`}
+                  onPointerDown={(e) => e.stopPropagation()}
+                >
+                  <span className="truncate font-sans font-medium text-sky-200 max-w-[140px]">
+                    {selectedVisualLayer.name}
+                  </span>
+                  <span className="shrink-0">
+                    {Math.round(selectedLayerRect.width * 100)}% ×{' '}
+                    {Math.round(selectedLayerRect.height * 100)}%
+                  </span>
+                  <button
+                    type="button"
+                    title={
+                      selectedVisualLayer.locked
+                        ? 'Desbloquear capa'
+                        : 'Bloquear capa'
+                    }
+                    aria-label={
+                      selectedVisualLayer.locked
+                        ? `Desbloquear ${selectedVisualLayer.name}`
+                        : `Bloquear ${selectedVisualLayer.name}`
+                    }
+                    onClick={() =>
+                      studioLayerEditor.onToggleLayerLock(
+                        studioLayerEditor.activeScene!.id,
+                        selectedVisualLayer.id,
+                        !selectedVisualLayer.locked
+                      )
+                    }
+                    className={`inline-flex items-center gap-1 rounded-full px-1 py-0.5 transition-colors cursor-pointer shrink-0 ${
+                      selectedVisualLayer.locked
+                        ? 'text-amber-300 hover:text-amber-200'
+                        : 'text-white/80 hover:text-white'
+                    }`}
+                  >
+                    {selectedVisualLayer.locked ? (
+                      <>
+                        <Lock className="w-2.5 h-2.5" />
+                        <span>Bloqueada</span>
+                      </>
+                    ) : (
+                      <Unlock className="w-2.5 h-2.5" />
+                    )}
+                  </button>
+                </div>
+
+                {!selectedVisualLayer.locked &&
+                  (
+                    [
+                      {
+                        id: 'top-left',
+                        posClass: 'top-1 left-1 cursor-nwse-resize',
+                        edgeClass: '-top-2 -left-2',
+                        label: 'Redimensionar esquina superior izquierda',
+                      },
+                      {
+                        id: 'top-right',
+                        posClass: 'top-1 right-1 cursor-nesw-resize',
+                        edgeClass: '-top-2 -right-2',
+                        label: 'Redimensionar esquina superior derecha',
+                      },
+                      {
+                        id: 'bottom-left',
+                        posClass: 'bottom-1 left-1 cursor-nesw-resize',
+                        edgeClass: '-bottom-2 -left-2',
+                        label: 'Redimensionar esquina inferior izquierda',
+                      },
+                      {
+                        id: 'bottom-right',
+                        posClass: 'bottom-1 right-1 cursor-nwse-resize',
+                        edgeClass: '-bottom-2 -right-2',
+                        label: 'Redimensionar esquina inferior derecha',
+                      },
+                    ] as const
+                  ).map((h) => {
+                    const useInnerHandle =
+                      selectedLayerRect.width >= 0.96 || selectedLayerRect.height >= 0.96;
+                    return (
+                      <button
+                        key={h.id}
+                        type="button"
+                        aria-label={h.label}
+                        onPointerDown={(e) => handleResizeHandlePointerDown(h.id, e)}
+                        className={`pointer-events-auto absolute ${
+                          useInnerHandle ? h.posClass : `${h.edgeClass} ${h.posClass.split(' ').pop()}`
+                        } w-4 h-4 flex items-center justify-center focus:outline-none`}
+                      >
+                        <span className="w-2.5 h-2.5 rounded-full bg-white border-2 border-sky-500 shadow-sm" />
+                      </button>
+                    );
+                  })}
+              </div>
+            )}
 
             {focus.peakingEnabled && (
               <canvas
@@ -511,28 +1027,6 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
                 <div className="absolute inset-10 border border-white/15 rounded-lg" />
               </div>
             )}
-
-            {focus.aiTrackingEnabled &&
-              detectedSubjects.map((subj, idx) => (
-                <div
-                  key={idx}
-                  className="pointer-events-none absolute transition-all duration-75"
-                  style={{
-                    left: `${subj.x * 100}%`,
-                    top: `${subj.y * 100}%`,
-                    width: `${subj.width * 100}%`,
-                    height: `${subj.height * 100}%`,
-                  }}
-                >
-                  <span className="absolute top-0 left-0 w-3.5 h-3.5 border-t-2 border-l-2 border-emerald-300/95 rounded-tl-md" />
-                  <span className="absolute top-0 right-0 w-3.5 h-3.5 border-t-2 border-r-2 border-emerald-300/95 rounded-tr-md" />
-                  <span className="absolute bottom-0 left-0 w-3.5 h-3.5 border-b-2 border-l-2 border-emerald-300/95 rounded-bl-md" />
-                  <span className="absolute bottom-0 right-0 w-3.5 h-3.5 border-b-2 border-r-2 border-emerald-300/95 rounded-br-md" />
-                  <span className="glass-clear absolute -top-6 left-0 whitespace-nowrap font-mono tabular-nums text-[10px] tracking-wider text-emerald-200 px-2 py-0.5 rounded-full">
-                    Sujeto {idx + 1} · {Math.round(subj.confidence * 100)}%
-                  </span>
-                </div>
-              ))}
 
             {showFocusReticle && (
               <div
@@ -903,10 +1397,22 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
               </GlassTooltip>
 
               <GlassButton
+                ref={shareDisplayBtnRef}
                 size="xs"
-                onClick={onShareDisplay}
+                onClick={() => {
+                  if (studioDisplayPopover?.enabled) {
+                    setDisplayPopoverOpen((v) => !v);
+                  } else {
+                    onShareDisplay();
+                  }
+                }}
                 variant={displayShared ? 'amber' : 'regular'}
-                title="Compartir pantalla o ventana en vivo"
+                aria-expanded={studioDisplayPopover?.enabled ? displayPopoverOpen : undefined}
+                title={
+                  studioDisplayPopover?.enabled
+                    ? 'Administrar pantallas y ventanas compartidas'
+                    : 'Compartir pantalla o ventana en vivo'
+                }
                 leadingIcon={<Monitor className="w-3.5 h-3.5 text-[var(--accent-blue)]" />}
               >
                 {displayShared ? 'Pantalla activa' : 'Compartir pantalla'}
@@ -988,6 +1494,160 @@ export const CameraViewport: React.FC<CameraViewportProps> = ({
               Galería
             </GlassButton>
           </div>
+        </div>
+      )}
+
+      {!cinemaMode && studioDisplayPopover?.enabled && displayPopoverOpen && (
+        <div
+          ref={displayPopoverRef}
+          role="dialog"
+          aria-label="Fuentes compartidas"
+          className={`${glassMaterialClass('dense')} absolute bottom-14 left-1/2 -translate-x-1/2 z-50 w-[min(92vw,360px)] rounded-[20px] p-3.5 space-y-2.5 shadow-[0_20px_50px_rgba(0,0,0,0.45)]`}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <h3 className="text-xs font-semibold text-[var(--text-primary)]">
+                Fuentes compartidas
+              </h3>
+              <p className="text-[10px] text-[var(--text-tertiary)]">
+                Se insertan detrás de la cámara por defecto
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDisplayPopoverOpen(false)}
+              className="text-[11px] text-[var(--text-tertiary)] hover:text-[var(--text-primary)] cursor-pointer"
+            >
+              Cerrar
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-1.5">
+            <GlassButton
+              size="xs"
+              variant="primary"
+              leadingIcon={<Plus className="w-3 h-3" />}
+              onClick={() => {
+                setDisplayPopoverOpen(false);
+                studioDisplayPopover.onAddDisplaySource('screen');
+              }}
+            >
+              Añadir pantalla
+            </GlassButton>
+            <GlassButton
+              size="xs"
+              variant="regular"
+              leadingIcon={<AppWindow className="w-3 h-3" />}
+              onClick={() => {
+                setDisplayPopoverOpen(false);
+                studioDisplayPopover.onAddDisplaySource('window');
+              }}
+            >
+              Añadir ventana
+            </GlassButton>
+          </div>
+
+          {(() => {
+            const displaySources = studioDisplayPopover.sources.filter(
+              (s) => s.kind === 'screen' || s.kind === 'window'
+            );
+            if (displaySources.length === 0) {
+              return (
+                <p className="text-[11px] text-[var(--text-tertiary)] py-1">
+                  Todavía no hay pantallas ni ventanas en el proyecto.
+                </p>
+              );
+            }
+            const runtimeById = new Map(
+              studioDisplayPopover.runtimeSources.map((r) => [r.id, r])
+            );
+            const diagByLayerId = new Map(
+              (studioDisplayPopover.layerDiagnostics ?? []).map((d) => [d.layerId, d])
+            );
+            return (
+              <div className="divide-y divide-[var(--border-hairline)] max-h-56 overflow-y-auto studio-scroll">
+                {displaySources.map((src) => {
+                  const runtime = runtimeById.get(src.id);
+                  const isLive = runtime?.status === 'live';
+                  const sceneLayer =
+                    studioDisplayPopover.activeScene?.layers.find(
+                      (l) => l.sourceId === src.id
+                    ) ?? null;
+                  const diag = sceneLayer ? diagByLayerId.get(sceneLayer.id) : undefined;
+                  const isSelected =
+                    sceneLayer && studioDisplayPopover.selectedLayerId === sceneLayer.id;
+                  const Icon = src.kind === 'window' ? AppWindow : Monitor;
+
+                  return (
+                    <div key={src.id} className="py-2 space-y-1.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <Icon className="w-3.5 h-3.5 text-[var(--accent-blue)] shrink-0" />
+                          <span className="text-xs font-medium text-[var(--text-primary)] truncate">
+                            {src.name}
+                          </span>
+                        </div>
+                        <span
+                          className={`text-[10px] font-medium shrink-0 ${
+                            isLive ? 'text-emerald-400' : 'text-[var(--text-tertiary)]'
+                          }`}
+                        >
+                          {isLive
+                            ? diag && diag.intrinsicWidth > 0
+                              ? `En vivo · ${diag.intrinsicWidth}×${diag.intrinsicHeight}`
+                              : 'En vivo'
+                            : 'Autorizar'}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <GlassButton
+                          size="xs"
+                          variant={isSelected ? 'primary' : 'regular'}
+                          onClick={() => {
+                            setDisplayPopoverOpen(false);
+                            studioDisplayPopover.onSelectOrAddDisplayLayer(src.id);
+                          }}
+                        >
+                          {sceneLayer ? (isSelected ? 'Seleccionada' : 'Seleccionar') : '+ Añadir detrás'}
+                        </GlassButton>
+                        <GlassButton
+                          size="xs"
+                          leadingIcon={<RefreshCw className="w-3 h-3" />}
+                          onClick={() => {
+                            setDisplayPopoverOpen(false);
+                            studioDisplayPopover.onChangeDisplayCapture(src.id);
+                          }}
+                        >
+                          {isLive ? 'Cambiar' : 'Autorizar'}
+                        </GlassButton>
+                        {sceneLayer && (
+                          <>
+                            <GlassButton
+                              size="xs"
+                              onClick={() =>
+                                studioDisplayPopover.onPlaceLayerBehindCamera(sceneLayer.id)
+                              }
+                            >
+                              Detrás
+                            </GlassButton>
+                            <GlassButton
+                              size="xs"
+                              onClick={() =>
+                                studioDisplayPopover.onMoveLayerToTop(sceneLayer.id)
+                              }
+                            >
+                              Frente
+                            </GlassButton>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
         </div>
       )}
 

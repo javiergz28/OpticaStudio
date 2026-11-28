@@ -3,13 +3,17 @@ import assert from 'node:assert/strict';
 import { addLayerToScene, addSource, createEmptyProject, createScene } from '../src/engine/sceneEngine';
 import { instantiatePresetProject, STUDIO_PRESETS } from '../src/engine/scenePresets';
 import {
+  applyPerimeterFeatherToRgbaBuffer,
   Canvas2dCompositorBackend,
   compositeStraightAlphaPixel,
   computeLayerRenderGeometry,
+  computeNormalizedFeatherAlpha,
+  computeSignedMaskDistancePx,
   INITIAL_PROGRAM_PROFILE,
   ProgramCompositor,
   resolveOutputDimensions,
   STANDARD_COMPOSITION_FORMATS,
+  traceMaskPathOn2dContext,
   type CompositorRenderBackend,
   type FrameSchedulerAdapter,
   type ProgramSurfaceLike,
@@ -81,6 +85,9 @@ function createMock2dSurface(width = 1920, height = 1080) {
     arc(x: number, y: number, r: number, s: number, e: number) {
       calls.push({ op: 'arc', args: [x, y, r, s, e] });
     },
+    ellipse(x: number, y: number, rx: number, ry: number, rot: number, s: number, e: number) {
+      calls.push({ op: 'ellipse', args: [x, y, rx, ry, rot, s, e] });
+    },
     moveTo(x: number, y: number) {
       calls.push({ op: 'moveTo', args: [x, y] });
     },
@@ -147,6 +154,9 @@ function createMockWebgl2Surface(width = 1920, height = 1080) {
   const deletedTextures: unknown[] = [];
   const texImageUploads: Array<{ tex: unknown; source: unknown }> = [];
   const drawCalls: number[] = [];
+  const uniformCalls: Array<{ name: string; values: unknown[] }> = [];
+  const pixelStoreiCalls: Array<{ pname: number; param: number }> = [];
+  const shaderSources: string[] = [];
   const listeners = new Map<string, Set<(ev?: unknown) => void>>();
 
   const gl = {
@@ -179,7 +189,9 @@ function createMockWebgl2Surface(width = 1920, height = 1080) {
     TRIANGLE_STRIP: 0x0005,
 
     createShader: () => ({ id: ++shaderSeq }),
-    shaderSource: () => {},
+    shaderSource: (_shader: unknown, src: string) => {
+      shaderSources.push(src);
+    },
     compileShader: () => {},
     getShaderParameter: () => true,
     deleteShader: () => {},
@@ -205,16 +217,26 @@ function createMockWebgl2Surface(width = 1920, height = 1080) {
     clear: () => {},
     useProgram: () => {},
     getUniformLocation: (_p: unknown, name: string) => ({ name }),
-    uniform1i: () => {},
-    uniform1f: () => {},
-    uniform2f: () => {},
-    uniform4f: () => {},
+    uniform1i: (loc: { name: string } | null, v: number) => {
+      if (loc) uniformCalls.push({ name: loc.name, values: [v] });
+    },
+    uniform1f: (loc: { name: string } | null, v: number) => {
+      if (loc) uniformCalls.push({ name: loc.name, values: [v] });
+    },
+    uniform2f: (loc: { name: string } | null, x: number, y: number) => {
+      if (loc) uniformCalls.push({ name: loc.name, values: [x, y] });
+    },
+    uniform4f: (loc: { name: string } | null, a: number, b: number, c: number, d: number) => {
+      if (loc) uniformCalls.push({ name: loc.name, values: [a, b, c, d] });
+    },
     uniformMatrix3fv: () => {},
     activeTexture: () => {},
     createTexture: () => ({ id: ++texSeq }),
     bindTexture: () => {},
     texParameteri: () => {},
-    pixelStorei: () => {},
+    pixelStorei: (pname: number, param: number) => {
+      pixelStoreiCalls.push({ pname, param });
+    },
     texImage2D: (_t: unknown, _l: unknown, _ifmt: unknown, _wOrFmt: unknown, _hOrType: unknown, _b?: unknown, _f?: unknown, _ty?: unknown, src?: unknown) => {
       texImageUploads.push({ tex: texSeq, source: src ?? _b });
     },
@@ -260,7 +282,18 @@ function createMockWebgl2Surface(width = 1920, height = 1080) {
     return prevented;
   }
 
-  return { surface, gl, deletedTextures, texImageUploads, drawCalls, emitSurfaceEvent, listeners };
+  return {
+    surface,
+    gl,
+    deletedTextures,
+    texImageUploads,
+    drawCalls,
+    uniformCalls,
+    pixelStoreiCalls,
+    shaderSources,
+    emitSurfaceEvent,
+    listeners,
+  };
 }
 
 function createFakeLayer(overrides: Partial<SceneLayer> = {}): SceneLayer {
@@ -1495,4 +1528,565 @@ test('24. Gestión y recuperación ante pérdida del contexto gráfico WebGL2 (w
 
   comp.dispose();
   assert.equal(glMock.listeners.get('webglcontextlost')?.size ?? 0, 0);
+});
+
+test('CP-P02-B [1]: Encuadre sin distorsión (cover/contain + contentZoom + pan X/Y) y borderEnabled=false', () => {
+  const layer = createFakeLayer({
+    transform: {
+      x: 0.1,
+      y: 0.1,
+      width: 0.25,
+      height: 0.5,
+      anchorX: 0,
+      anchorY: 0,
+      rotationDeg: 0,
+      flipH: false,
+      flipV: false,
+      fitMode: 'cover',
+      contentZoom: 2,
+      contentOffsetX: 0.5,
+      contentOffsetY: -0.5,
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+    },
+    style: {
+      opacity: 0.85,
+      blendMode: 'normal',
+      borderRadiusPx: 24,
+      borderEnabled: false,
+      borderWidthPx: 8,
+      borderColor: '#FF0000',
+      shadowColor: '#000000',
+      shadowOpacity: 0.4,
+      shadowBlurPx: 20,
+      featherPx: 18,
+      maskShape: 'squircle',
+    },
+  });
+
+  // Cámara 16:9 (1920x1080) dentro de contenedor vertical (480x540 en lienzo 1920x1080)
+  const geoCover = computeLayerRenderGeometry(layer, 1920, 1080, 1920, 1080);
+  assert.equal(geoCover.borderWidthPx, 0, 'borderEnabled=false debe anular el grosor efectivo');
+  assert.equal(geoCover.featherPx, 18);
+  // Con contentZoom = 2 en cover, el rectángulo fuente visible se reduce a la mitad sin deformar relación de aspecto
+  assert.ok(geoCover.sourceRect.sw < 1920 * 0.5 && geoCover.sourceRect.sh <= 540 + 1e-4);
+  const dstAspect = geoCover.layerBox.width / geoCover.layerBox.height;
+  const srcAspect = geoCover.sourceRect.sw / geoCover.sourceRect.sh;
+  assert.ok(Math.abs(dstAspect - srcAspect) < 1e-3, 'cover no debe distorsionar la relación de aspecto');
+  assert.ok(
+    geoCover.sourceRect.sx >= 0 && geoCover.sourceRect.sx + geoCover.sourceRect.sw <= 1920 + 1e-4
+  );
+  assert.ok(
+    geoCover.sourceRect.sy >= 0 && geoCover.sourceRect.sy + geoCover.sourceRect.sh <= 1080 + 1e-4
+  );
+
+  // Modo contain mantiene relación 16:9 en contentLocalRect dentro de caja cuadrada/vertical
+  const containLayer = createFakeLayer({
+    transform: { ...layer.transform, fitMode: 'contain', contentZoom: 1, contentOffsetX: 0, contentOffsetY: 0 },
+  });
+  const geoContain = computeLayerRenderGeometry(containLayer, 1920, 1080, 1920, 1080);
+  assert.ok(
+    Math.abs(geoContain.contentLocalRect.width / geoContain.contentLocalRect.height - 16 / 9) < 1e-3
+  );
+});
+
+test('CP-P02-B [2]: Difuminado perimetral real sin halos negros ni blancos en todas las formas e independiente de opacidad', () => {
+  // 1. Todas las 6 formas generan distancia negativa en interior y >=0 fuera
+  const shapes: Array<'rect' | 'square' | 'rounded' | 'squircle' | 'circle' | 'ellipse'> = [
+    'rect',
+    'square',
+    'rounded',
+    'squircle',
+    'circle',
+    'ellipse',
+  ];
+
+  for (const shape of shapes) {
+    const centerSd = computeSignedMaskDistancePx(100, 70, 200, 140, shape, 24);
+    const edgeX = shape === 'circle' || shape === 'square' ? 170 : 200;
+    const edgeSd = computeSignedMaskDistancePx(edgeX, 70, 200, 140, shape, 24);
+    assert.ok(centerSd < -20, `Centro de ${shape} debe ser interior (${centerSd})`);
+    assert.ok(edgeSd >= -1, `Borde de ${shape} debe estar en el límite (${edgeSd})`);
+
+    // Validar que traceMaskPathOn2dContext funciona sin lanzar errores para las 6 formas
+    const mock2d = createMock2dSurface(200, 140);
+    traceMaskPathOn2dContext(mock2d.ctx as unknown as CanvasRenderingContext2D, 200, 140, shape, 24);
+    if (shape === 'ellipse') {
+      assert.ok(mock2d.calls.some((c) => c.op === 'ellipse'));
+    }
+  }
+
+  // 2. Curva Hermite del difuminado: 0 fuera, entre 0 y 1 dentro del perímetro, 1 en el núcleo interior
+  assert.equal(computeNormalizedFeatherAlpha(1, 20), 0);
+  const midAlpha = computeNormalizedFeatherAlpha(-10, 20);
+  assert.ok(midAlpha > 0.45 && midAlpha < 0.55);
+  assert.equal(computeNormalizedFeatherAlpha(-25, 20), 1);
+
+  // 3. Prueba en búfer RGBA recto sobre fondo azul (0, 120, 255): sin halos negros ni blancos y sin multiplicar RGB
+  const width = 40;
+  const height = 40;
+  const rgba = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < width * height; i++) {
+    rgba[i * 4] = 240;
+    rgba[i * 4 + 1] = 200;
+    rgba[i * 4 + 2] = 160;
+    rgba[i * 4 + 3] = 200; // sujeto semitransparente (compatible con futuro CP-P02-C)
+  }
+
+  applyPerimeterFeatherToRgbaBuffer(rgba, width, height, 'circle', 0, 10);
+
+  // Centro conserva alpha=200 y RGB intacto
+  const centerIdx = (20 * width + 20) * 4;
+  assert.equal(rgba[centerIdx + 3], 200);
+  assert.equal(rgba[centerIdx], 240);
+
+  // Esquina exterior queda transparente (alpha=0) y conserva canales RGB rectos (sin ennegrecer/blanquear)
+  const cornerIdx = 0;
+  assert.equal(rgba[cornerIdx + 3], 0);
+  assert.equal(rgba[cornerIdx], 240);
+
+  // Zona intermedia del difuminado: al componer en alfa recto sobre fondo azul (0,120,255),
+  // todos los canales resultantes quedan estrictamente acotados entre fondo y sujeto (zero black/white halo)
+  const borderSampleIdx = (20 * width + 3) * 4;
+  const aNorm = rgba[borderSampleIdx + 3]! / 255;
+  assert.ok(aNorm > 0 && aNorm < 200 / 255);
+  const out = compositeStraightAlphaPixel(
+    [0, 120, 255, 255],
+    [
+      rgba[borderSampleIdx]!,
+      rgba[borderSampleIdx + 1]!,
+      rgba[borderSampleIdx + 2]!,
+      rgba[borderSampleIdx + 3]!,
+    ]
+  );
+  assert.ok(out[0] >= 0 && out[0] <= 240);
+  assert.ok(out[1] >= 120 && out[1] <= 200);
+  assert.ok(out[2] >= 160 && out[2] <= 255);
+});
+
+test('CP-P02-B [3]: Backend WebGL2 ejecuta sombra real + 6 formas + difuminado perimetral sin borde obligatorio y listo para alfa transparente', () => {
+  const glMock = createMockWebgl2Surface(1920, 1080);
+  const comp = new ProgramCompositor({ surface: glMock.surface, preferredBackend: 'webgl2' });
+  const camSrc: StudioSource = {
+    id: 'src_cam',
+    kind: 'camera',
+    name: 'Cámara',
+    createdAt: 1,
+    deviceId: 'c1',
+    preferredWidth: 1920,
+    preferredHeight: 1080,
+    preferredFps: 30,
+  };
+
+  const layer = createFakeLayer({
+    id: 'cam_layer',
+    sourceId: 'src_cam',
+    transform: {
+      x: 0.2,
+      y: 0.15,
+      width: 0.4,
+      height: 0.4,
+      anchorX: 0,
+      anchorY: 0,
+      rotationDeg: 0,
+      flipH: false,
+      flipV: false,
+      fitMode: 'cover',
+      contentZoom: 1.5,
+      contentOffsetX: 0.25,
+      contentOffsetY: -0.25,
+      crop: { top: 0, right: 0, bottom: 0, left: 0 },
+    },
+    style: {
+      opacity: 0.7,
+      blendMode: 'normal',
+      borderRadiusPx: 32,
+      borderEnabled: false,
+      borderWidthPx: 6,
+      borderColor: '#FFFFFF',
+      shadowColor: '#0F172A',
+      shadowOpacity: 0.6,
+      shadowBlurPx: 28,
+      featherPx: 24,
+      maskShape: 'ellipse',
+    },
+  });
+
+  comp.setSceneData(
+    {
+      id: 'sc1',
+      name: 'Styled Cam',
+      backgroundColor: '#000',
+      transition: { type: 'cut', durationMs: 0 },
+      layers: [layer],
+      audioSourceIds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    [camSrc],
+    [
+      {
+        source: camSrc,
+        state: { sourceId: 'src_cam', status: 'live', intrinsicWidth: 1920, intrinsicHeight: 1080, lastUpdatedAt: 0 },
+        details: {
+          errorCode: null,
+          disconnectionReason: 'none',
+          disconnectedAt: null,
+          trackMuted: false,
+          hasVideoTrack: true,
+          hasAudioTrack: false,
+          effectiveSettings: null,
+          capabilities: null,
+          sharedAudioFromSourceId: null,
+          sharedVideoFromSourceId: null,
+          createdObjectUrl: null,
+          consumerIds: ['c'],
+          referenceCount: 1,
+          hasPendingOperation: false,
+        },
+        resources: {
+          sourceId: 'src_cam',
+          videoElement: { videoWidth: 1920, videoHeight: 1080, readyState: 4, currentTime: 1 } as unknown as HTMLVideoElement,
+        },
+      },
+    ]
+  );
+
+  comp.renderFrameNow();
+
+  // Debe emitir pasada de sombra (u_renderPass=1) y pasada principal (u_renderPass=0) con shape=5 (ellipse), borderWidth=0, featherPx=24
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_renderPass' && u.values[0] === 1));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_renderPass' && u.values[0] === 0));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_maskShape' && u.values[0] === 5));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_borderWidthPx' && u.values[0] === 0));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_featherPx' && u.values[0] === 24));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_opacity' && Math.abs(Number(u.values[0]) - 0.7) < 1e-4));
+
+  comp.dispose();
+});
+
+test('CP-P02-C1 [1]: Encuadre completo de ventana/pantalla con recorte independiente por bordes (crop) y adaptación dinámica de tamaño', () => {
+  // Ventana de 2000x1000 con recorte superior (barra navegador 10%), inferior 5%, izquierdo 10%, derecho 20%
+  // Área útil restante: sx=200, sy=100, sw=1400, sh=850
+  const croppedWindowLayer = createFakeLayer({
+    id: 'win_layer',
+    sourceId: 'src_win',
+    transform: {
+      x: 0.1,
+      y: 0.1,
+      width: 0.7,
+      height: 0.7,
+      anchorX: 0,
+      anchorY: 0,
+      rotationDeg: 0,
+      flipH: false,
+      flipV: false,
+      fitMode: 'contain',
+      contentZoom: 1,
+      contentOffsetX: 0,
+      contentOffsetY: 0,
+      crop: { top: 0.1, right: 0.2, bottom: 0.05, left: 0.1 },
+    },
+  });
+
+  const geoContain = computeLayerRenderGeometry(croppedWindowLayer, 2000, 1000, 1920, 1080);
+  assert.ok(Math.abs(geoContain.sourceRect.sx - 200) < 1e-4);
+  assert.ok(Math.abs(geoContain.sourceRect.sy - 100) < 1e-4);
+  assert.ok(Math.abs(geoContain.sourceRect.sw - 1400) < 1e-4);
+  assert.ok(Math.abs(geoContain.sourceRect.sh - 850) < 1e-4);
+  // Sin distorsión en contain: contentLocalRect respeta exactamente 1400/850
+  assert.ok(
+    Math.abs(
+      geoContain.contentLocalRect.width / geoContain.contentLocalRect.height - 1400 / 850
+    ) < 1e-3
+  );
+
+  // Combinar recorte de bordes + zoom interno 2x y desplazamiento en cover
+  const zoomedCroppedLayer = createFakeLayer({
+    transform: {
+      ...croppedWindowLayer.transform,
+      fitMode: 'cover',
+      contentZoom: 2,
+      contentOffsetX: 0.5,
+      contentOffsetY: -0.5,
+    },
+  });
+  const geoZoom = computeLayerRenderGeometry(zoomedCroppedLayer, 2000, 1000, 1920, 1080);
+  // El rectángulo fuente debe permanecer estrictamente dentro de la zona recortada [200..1600, 100..950]
+  assert.ok(geoZoom.sourceRect.sx >= 200 - 1e-4);
+  assert.ok(geoZoom.sourceRect.sy >= 100 - 1e-4);
+  assert.ok(geoZoom.sourceRect.sx + geoZoom.sourceRect.sw <= 1600 + 1e-4);
+  assert.ok(geoZoom.sourceRect.sy + geoZoom.sourceRect.sh <= 950 + 1e-4);
+  assert.ok(
+    Math.abs(
+      geoZoom.sourceRect.sw / geoZoom.sourceRect.sh -
+        geoZoom.layerBox.width / geoZoom.layerBox.height
+    ) < 1e-3
+  );
+
+  // Adaptación dinámica de resolución de ventana en vivo desde ProgramCompositor sin reiniciar pista
+  const glMock = createMockWebgl2Surface(1920, 1080);
+  const comp = new ProgramCompositor({ surface: glMock.surface, preferredBackend: 'webgl2' });
+  const winSrc: StudioSource = {
+    id: 'src_win',
+    kind: 'window',
+    name: 'Navegador',
+    createdAt: 1,
+    includeSystemAudio: false,
+  };
+  const fakeWindowVideo = {
+    videoWidth: 1600,
+    videoHeight: 900,
+    readyState: 4,
+    currentTime: 1,
+  } as unknown as HTMLVideoElement;
+
+  const winScene: StudioScene = {
+    id: 'sc_win',
+    name: 'Ventana',
+    backgroundColor: '#000',
+    transition: { type: 'cut', durationMs: 0 },
+    layers: [croppedWindowLayer],
+    audioSourceIds: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  comp.setSceneData(winScene, [winSrc], [
+    {
+      source: winSrc,
+      state: { sourceId: 'src_win', status: 'live', intrinsicWidth: 1600, intrinsicHeight: 900, lastUpdatedAt: 0 },
+      details: {
+        errorCode: null,
+        disconnectionReason: 'none',
+        disconnectedAt: null,
+        trackMuted: false,
+        hasVideoTrack: true,
+        hasAudioTrack: false,
+        effectiveSettings: null,
+        capabilities: null,
+        sharedAudioFromSourceId: null,
+        sharedVideoFromSourceId: null,
+        createdObjectUrl: null,
+        consumerIds: ['c'],
+        referenceCount: 1,
+        hasPendingOperation: false,
+      },
+      resources: { sourceId: 'src_win', videoElement: fakeWindowVideo },
+    },
+  ]);
+
+  const plan1 = comp.buildSceneRenderPlan(winScene);
+  assert.equal(plan1.diagnostics[0]?.intrinsicWidth, 1600);
+  assert.equal(plan1.diagnostics[0]?.intrinsicHeight, 900);
+
+  // Redimensión dinámica de la ventana compartida (ej. usuario cambia ventana a vertical 900x1200)
+  (fakeWindowVideo as unknown as { videoWidth: number; videoHeight: number }).videoWidth = 900;
+  (fakeWindowVideo as unknown as { videoWidth: number; videoHeight: number }).videoHeight = 1200;
+  const plan2 = comp.buildSceneRenderPlan(winScene);
+  assert.equal(plan2.diagnostics[0]?.intrinsicWidth, 900);
+  assert.equal(plan2.diagnostics[0]?.intrinsicHeight, 1200);
+  const ratioAfter =
+    plan2.layers[0]!.geometry.contentLocalRect.width /
+    plan2.layers[0]!.geometry.contentLocalRect.height;
+  // Con crop horizontal 30% (sw=630) y vertical 15% (sh=1020) => 630/1020 ≈ 0.6176
+  assert.ok(Math.abs(ratioAfter - 630 / 1020) < 1e-3);
+
+  comp.dispose();
+});
+
+test('CP-P02-C1 [2]: Formas, borde opcional, sombra, opacidad y difuminado en capa screen/window por WebGL2 sin filtros de cámara', () => {
+  const glMock = createMockWebgl2Surface(1920, 1080);
+  const comp = new ProgramCompositor({ surface: glMock.surface, preferredBackend: 'webgl2' });
+  const screenSrc: StudioSource = {
+    id: 'src_screen',
+    kind: 'screen',
+    name: 'Pantalla Retina',
+    createdAt: 1,
+    includeSystemAudio: false,
+  };
+  const screenLayer = createFakeLayer({
+    id: 'screen_layer',
+    sourceId: 'src_screen',
+    transform: {
+      x: 0.05,
+      y: 0.08,
+      width: 0.9,
+      height: 0.84,
+      anchorX: 0,
+      anchorY: 0,
+      rotationDeg: 0,
+      flipH: false,
+      flipV: false,
+      fitMode: 'contain',
+      contentZoom: 1,
+      contentOffsetX: 0,
+      contentOffsetY: 0,
+      crop: { top: 0.05, right: 0, bottom: 0.05, left: 0 },
+    },
+    style: {
+      opacity: 0.92,
+      blendMode: 'normal',
+      maskShape: 'squircle',
+      borderRadiusPx: 28,
+      borderEnabled: true,
+      borderWidthPx: 4,
+      borderColor: '#0A84FF',
+      shadowBlurPx: 30,
+      shadowOpacity: 0.5,
+      shadowColor: '#000000',
+      featherPx: 14,
+    },
+  });
+
+  comp.setSceneData(
+    {
+      id: 'sc_screen',
+      name: 'Screen Styled',
+      backgroundColor: '#000',
+      transition: { type: 'cut', durationMs: 0 },
+      layers: [screenLayer],
+      audioSourceIds: [],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    [screenSrc],
+    [
+      {
+        source: screenSrc,
+        state: { sourceId: 'src_screen', status: 'live', intrinsicWidth: 2560, intrinsicHeight: 1600, lastUpdatedAt: 0 },
+        details: {
+          errorCode: null,
+          disconnectionReason: 'none',
+          disconnectedAt: null,
+          trackMuted: false,
+          hasVideoTrack: true,
+          hasAudioTrack: false,
+          effectiveSettings: null,
+          capabilities: null,
+          sharedAudioFromSourceId: null,
+          sharedVideoFromSourceId: null,
+          createdObjectUrl: null,
+          consumerIds: ['c'],
+          referenceCount: 1,
+          hasPendingOperation: false,
+        },
+        resources: {
+          sourceId: 'src_screen',
+          videoElement: { videoWidth: 2560, videoHeight: 1600, readyState: 4, currentTime: 1 } as unknown as HTMLVideoElement,
+        },
+      },
+    ]
+  );
+
+  comp.renderFrameNow();
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_maskShape' && u.values[0] === 3)); // squircle
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_borderWidthPx' && u.values[0] === 4));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_featherPx' && u.values[0] === 14));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_opacity' && Math.abs(Number(u.values[0]) - 0.92) < 1e-4));
+
+  comp.dispose();
+});
+
+test('CP-P02-C3-R2: WebGL2 configura UNPACK_PREMULTIPLY_ALPHA_WEBGL y descontaminación por GPU solo para recorte transparente premultiplicado', () => {
+  const glMock = createMockWebgl2Surface(1920, 1080);
+  const comp = new ProgramCompositor({ surface: glMock.surface, preferredBackend: 'webgl2' });
+  const camSrc: StudioSource = {
+    id: 'src_cam_cutout',
+    kind: 'camera',
+    name: 'Cámara Presentador',
+    createdAt: 1,
+    deviceId: 'cam-1',
+    preferredWidth: 1920,
+    preferredHeight: 1080,
+    preferredFps: 30,
+  };
+  const camLayer = createFakeLayer({
+    id: 'layer_cam_cutout',
+    sourceId: 'src_cam_cutout',
+  });
+  const scene: StudioScene = {
+    id: 'sc_cutout',
+    name: 'Cutout',
+    backgroundColor: '#123456',
+    transition: { type: 'cut', durationMs: 0 },
+    layers: [camLayer],
+    audioSourceIds: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  comp.setSceneData(scene, [camSrc], [
+    {
+      source: camSrc,
+      state: { sourceId: 'src_cam_cutout', status: 'live', intrinsicWidth: 1280, intrinsicHeight: 720, lastUpdatedAt: 0 },
+      details: {
+        errorCode: null,
+        disconnectionReason: 'none',
+        disconnectedAt: null,
+        trackMuted: false,
+        hasVideoTrack: true,
+        hasAudioTrack: false,
+        effectiveSettings: null,
+        capabilities: null,
+        sharedAudioFromSourceId: null,
+        sharedVideoFromSourceId: null,
+        createdObjectUrl: null,
+        consumerIds: ['c'],
+        referenceCount: 1,
+        hasPendingOperation: false,
+      },
+      resources: {
+        sourceId: 'src_cam_cutout',
+        videoElement: { videoWidth: 1280, videoHeight: 720, readyState: 4, currentTime: 1 } as unknown as HTMLVideoElement,
+      },
+    },
+  ]);
+
+  const fakeCanvas = { width: 1280, height: 720 } as unknown as HTMLCanvasElement;
+
+  // 1. Subida straight-alpha sin recorte transparente: UNPACK_PREMULTIPLY_ALPHA_WEBGL=0, u_alphaMode=0, u_hasTransparentAlpha=0
+  comp.setProcessedLayerSurface('src_cam_cutout', {
+    surface: fakeCanvas,
+    width: 1280,
+    height: 720,
+    alphaMode: 'straight',
+    frameVersion: 1,
+    hasTransparentSubject: false,
+  });
+  comp.renderFrameNow();
+
+  assert.ok(
+    glMock.pixelStoreiCalls.some(
+      (c) => c.pname === glMock.gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL && c.param === 0
+    )
+  );
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_alphaMode' && u.values[0] === 0));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_hasTransparentAlpha' && u.values[0] === 0));
+
+  // 2. Subida premultiplied con hasTransparentSubject=true: UNPACK_PREMULTIPLY_ALPHA_WEBGL=1, u_alphaMode=1, u_hasTransparentAlpha=1
+  glMock.pixelStoreiCalls.length = 0;
+  glMock.uniformCalls.length = 0;
+  comp.setProcessedLayerSurface('src_cam_cutout', {
+    surface: fakeCanvas,
+    width: 1280,
+    height: 720,
+    alphaMode: 'premultiplied',
+    frameVersion: 2,
+    hasTransparentSubject: true,
+  });
+  comp.renderFrameNow();
+
+  assert.ok(
+    glMock.pixelStoreiCalls.some(
+      (c) => c.pname === glMock.gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL && c.param === 1
+    )
+  );
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_alphaMode' && u.values[0] === 1));
+  assert.ok(glMock.uniformCalls.some((u) => u.name === 'u_hasTransparentAlpha' && u.values[0] === 1));
+
+  // Verificar que el fragment shader protege straight-alpha y solo aplica descontaminación en modo premultiplied transparente
+  const frag = glMock.shaderSources.find((s) => s.includes('u_hasTransparentAlpha')) ?? '';
+  assert.ok(frag.includes('u_hasTransparentAlpha == 1 && u_alphaMode == 1'));
+
+  comp.dispose();
 });

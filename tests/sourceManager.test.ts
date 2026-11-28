@@ -1188,3 +1188,64 @@ test('20. Prevención de listeners huérfanos, política paused/resume y descone
     assert.equal(aud.getListenerCount(), 0);
   }
 });
+
+test('21. CP-P02-C3-R2: reconectar captura en vivo (force=true) preserva el stream activo si el usuario cancela el selector', async () => {
+  const h = createTestHarness();
+  const originalTrack = new MockMediaTrack({
+    id: 'orig_screen_track',
+    kind: 'video',
+    label: 'Pantalla Principal',
+    settings: { width: 2560, height: 1440, frameRate: 60 },
+  });
+  const originalStream = new MockMediaStream('orig_screen_stream', [originalTrack]);
+  const replacementTrack = new MockMediaTrack({
+    id: 'new_screen_track',
+    kind: 'video',
+    label: 'Monitor Externo',
+    settings: { width: 1920, height: 1080, frameRate: 60 },
+  });
+  const replacementStream = new MockMediaStream('new_screen_stream', [replacementTrack]);
+
+  let attempt = 0;
+  h.setDisplayMediaImpl(async () => {
+    attempt += 1;
+    if (attempt === 1) return originalStream;
+    if (attempt === 2) {
+      const err = new Error('Permission dismissed by user');
+      err.name = 'NotAllowedError';
+      throw err;
+    }
+    return replacementStream;
+  });
+
+  const sm = h.createManager();
+  const scr: ScreenSourceDefinition = {
+    id: 'src_screen_preserve',
+    kind: 'screen',
+    name: 'Pantalla 1',
+    createdAt: 1,
+    includeSystemAudio: false,
+  };
+
+  const first = await sm.acquireSource(scr, 'scene_1');
+  assert.equal(first.state.status, 'live');
+  assert.equal(first.resources.mediaStream?.id, 'orig_screen_stream');
+
+  // El usuario abre "Cambiar captura" y cancela el selector -> se conserva la pantalla original
+  const canceled = await sm.reconnectSource(scr.id, { force: true });
+  assert.ok(canceled);
+  assert.equal(canceled.state.status, 'live');
+  assert.equal(canceled.resources.mediaStream?.id, 'orig_screen_stream');
+  assert.equal(canceled.details.errorCode, 'user-canceled');
+  assert.equal(originalTrack.stopCount, 0, 'No debe detener el stream vivo tras cancelar');
+
+  // El usuario intenta de nuevo y ahora elige otra pantalla -> reemplaza limpiamente y detiene la anterior
+  const replaced = await sm.reconnectSource(scr.id, { force: true });
+  assert.ok(replaced);
+  assert.equal(replaced.state.status, 'live');
+  assert.equal(replaced.resources.mediaStream?.id, 'new_screen_stream');
+  assert.equal(originalTrack.stopCount, 1, 'El stream antiguo se detiene solo tras confirmar el reemplazo');
+  assert.equal(replacementTrack.stopCount, 0);
+
+  sm.disposeAll();
+});

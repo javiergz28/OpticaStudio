@@ -6,8 +6,13 @@ import {
   StudioCoordinator,
   type LegacyStreamHandoff,
 } from '../src/engine/studioCoordinator';
+import {
+  cloneCompositionSnapshot,
+  CompositionHistory,
+} from '../src/engine/compositionHistory';
 import { STUDIO_ENGINE_COMPATIBILITY_MATRIX } from '../src/engine/engineCompatibility';
 import { addLayerToScene, addSource, createScene } from '../src/engine/sceneEngine';
+import { loadStudioAssetBlob } from '../src/utils/studioAssetStore';
 import {
   createInMemoryStudioStorageAdapter,
   saveStudioProject,
@@ -1094,5 +1099,990 @@ test('CP-P01-E4: sharing from a camera-only scene selects a scene containing the
   assert.equal(entry?.state.status, 'live');
   assert.equal(h.getDisplayMediaCalls(), 1);
   assert.ok(coord.getActiveScene()?.layers.some(layer => layer.visible && layer.sourceId === entry?.source.id));
+  coord.dispose();
+});
+
+test('CP-P02-A [1]: Persistencia por escena de capa de cámara sin reiniciar fuentes ni alterar ProgramCanvas', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+
+  const gumCallsBefore = h.getUserMediaCalls();
+  const gdmCallsBefore = h.getDisplayMediaCalls();
+  const surfaceBefore = coord.getProgramSurface();
+  const widthBefore = surfaceBefore.width;
+  const heightBefore = surfaceBefore.height;
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const camScene = coord.getProject().scenes.find((s) => s.presetId === 'camera-primary')!;
+  const camSrcId = coord.getProject().sources.find((s) => s.kind === 'camera')!.id;
+  const pipCamLayer = pipScene.layers.find((l) => l.sourceId === camSrcId)!;
+  const camPrimaryLayer = camScene.layers.find((l) => l.sourceId === camSrcId)!;
+
+  // Editar capa de cámara en escena PiP
+  const updPip = coord.updateSceneLayerTransform(pipScene.id, pipCamLayer.id, {
+    x: 0.04,
+    y: 0.05,
+    width: 0.3,
+    height: 0.3,
+  });
+  assert.equal(updPip.ok, true);
+  assert.equal(updPip.layer?.transform.x, 0.04);
+  assert.equal(updPip.layer?.transform.width, 0.3);
+
+  // Cambiar a Cámara Principal y comprobar que conserva su propio encuadre independiente
+  await coord.switchScene(camScene.id, { type: 'cut', durationMs: 0 });
+  const camLayerNow = coord
+    .getProject()
+    .scenes.find((s) => s.id === camScene.id)!
+    .layers.find((l) => l.id === camPrimaryLayer.id)!;
+  assert.equal(camLayerNow.transform.width, 1);
+  assert.equal(camLayerNow.transform.height, 1);
+
+  // Volver a PiP y vaciar persistencia
+  await coord.switchScene(pipScene.id, { type: 'cut', durationMs: 0 });
+  await coord.flushPersistence();
+
+  // Nunca reinició cámara ni pantalla ni alteró ProgramCanvas
+  assert.equal(h.getUserMediaCalls(), gumCallsBefore);
+  assert.equal(h.getDisplayMediaCalls(), gdmCallsBefore);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+  assert.equal(coord.getProgramSurface(), surfaceBefore);
+  assert.equal(coord.getProgramSurface().width, widthBefore);
+  assert.equal(coord.getProgramSurface().height, heightBefore);
+
+  coord.dispose();
+
+  // Remontar nuevo coordinador sobre el mismo storageAdapter y verificar persistencia independiente por escena
+  const h2 = createHarness();
+  const coord2 = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h2.mediaDevices, mediaElements: h2.mediaElements },
+    surfaceFactory: h2.surfaces.factory,
+    scheduler: h2.scheduler,
+    now: h2.now,
+  });
+  await coord2.mount();
+  assert.equal(coord2.getLastLoadSource(), 'stored');
+  const restoredPip = coord2.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const restoredCam = coord2.getProject().scenes.find((s) => s.presetId === 'camera-primary')!;
+  assert.equal(
+    restoredPip.layers.find((l) => l.sourceId === camSrcId)?.transform.width,
+    0.3
+  );
+  assert.equal(
+    restoredCam.layers.find((l) => l.sourceId === camSrcId)?.transform.width,
+    1
+  );
+  coord2.dispose();
+});
+
+test('CP-P02-A [2] / CP-P02-B: Sin límite del 50% sobre pantalla compartida y respeto de bloqueo de capa', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const camSrcId = coord.getProject().sources.find((s) => s.kind === 'camera')!.id;
+  const pipCamLayer = pipScene.layers.find((l) => l.sourceId === camSrcId)!;
+
+  // Agrandar cámara hasta el 90% en escena con ventana visible (ya sin límite del 50%)
+  const oversized = coord.updateSceneLayerTransform(
+    pipScene.id,
+    pipCamLayer.id,
+    { width: 0.9, height: 0.9 },
+    { preserveAspectK: 1 }
+  );
+  assert.equal(oversized.ok, true);
+  assert.equal(oversized.constraintApplied, false);
+  assert.ok(Math.abs((oversized.layer?.transform.width ?? 0) - 0.9) < 1e-4);
+  assert.ok(Math.abs((oversized.layer?.transform.height ?? 0) - 0.9) < 1e-4);
+
+  // Bloquear capa e intentar moverla o cambiar estilo
+  assert.equal(coord.setSceneLayerLocked(pipScene.id, pipCamLayer.id, true), true);
+  const blockedEdit = coord.updateSceneLayerTransform(pipScene.id, pipCamLayer.id, {
+    x: 0.1,
+    y: 0.1,
+  });
+  assert.equal(blockedEdit.ok, false);
+  assert.match(blockedEdit.reason ?? '', /bloqueada/i);
+
+  const blockedStyle = coord.updateSceneLayerStyle(pipScene.id, pipCamLayer.id, {
+    maskShape: 'circle',
+  });
+  assert.equal(blockedStyle.ok, false);
+
+  // Desbloquear y confirmar persistencia de estado unlocked
+  assert.equal(coord.setSceneLayerLocked(pipScene.id, pipCamLayer.id, false), true);
+  const unlockedEdit = coord.updateSceneLayerTransform(pipScene.id, pipCamLayer.id, {
+    x: 0.1,
+    y: 0.1,
+  });
+  assert.equal(unlockedEdit.ok, true);
+  assert.ok(Math.abs((unlockedEdit.layer?.transform.x ?? 0) - 0.1) < 1e-4);
+
+  coord.dispose();
+});
+
+test('CP-P02-B: Edición en vivo de estilos, formas, difuminado y composición adaptable sin reiniciar pistas ni ProgramCanvas', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+
+  const gumBefore = h.getUserMediaCalls();
+  const gdmBefore = h.getDisplayMediaCalls();
+  const surfaceBefore = coord.getProgramSurface();
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const camScene = coord.getProject().scenes.find((s) => s.presetId === 'camera-primary')!;
+  const camSrcId = coord.getProject().sources.find((s) => s.kind === 'camera')!.id;
+  const pipCamLayer = pipScene.layers.find((l) => l.sourceId === camSrcId)!;
+  const camPrimaryLayer = camScene.layers.find((l) => l.sourceId === camSrcId)!;
+
+  // 1. Cambiar forma, difuminado, sombra, opacidad y borde desactivado en vivo sobre la escena PiP
+  const styleRes = coord.updateSceneLayerStyle(pipScene.id, pipCamLayer.id, {
+    maskShape: 'squircle',
+    borderRadiusPx: 36,
+    borderEnabled: false,
+    borderWidthPx: 8,
+    borderColor: '#0A84FF',
+    shadowBlurPx: 32,
+    shadowOpacity: 0.55,
+    shadowColor: '#0F172A',
+    featherPx: 26,
+    opacity: 0.88,
+  });
+  assert.equal(styleRes.ok, true);
+  assert.equal(styleRes.layer?.style.maskShape, 'squircle');
+  assert.equal(styleRes.layer?.style.borderEnabled, false);
+  assert.equal(styleRes.layer?.style.featherPx, 26);
+
+  // 2. Actualizar encuadre interno y proporción independiente + composición adaptable split-horizontal
+  const aspectRes = coord.updateSceneLayerTransform(pipScene.id, pipCamLayer.id, {
+    aspectPreset: '1:1',
+    contentZoom: 1.75,
+    contentOffsetX: 0.35,
+    contentOffsetY: -0.2,
+    rotationDeg: 15,
+  });
+  assert.equal(aspectRes.ok, true);
+
+  const layoutRes = coord.applyAdaptableLayout(pipScene.id, 'split-horizontal');
+  assert.equal(layoutRes.ok, true);
+  const splitCam = coord
+    .getProject()
+    .scenes.find((s) => s.id === pipScene.id)!
+    .layers.find((l) => l.id === pipCamLayer.id)!;
+  assert.equal(splitCam.transform.width, 0.5);
+  assert.equal(splitCam.transform.height, 1);
+
+  // La otra escena conserva intactos su estilo y proporción por escena
+  const camPrimaryNow = coord
+    .getProject()
+    .scenes.find((s) => s.id === camScene.id)!
+    .layers.find((l) => l.id === camPrimaryLayer.id)!;
+  assert.equal(camPrimaryNow.style.maskShape, 'rect');
+  assert.equal(camPrimaryNow.style.featherPx, 0);
+
+  // Cero reinicios de pistas, cero stops y mismo ProgramCanvas
+  assert.equal(h.getUserMediaCalls(), gumBefore);
+  assert.equal(h.getDisplayMediaCalls(), gdmBefore);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+  assert.equal(coord.getProgramSurface(), surfaceBefore);
+
+  await coord.flushPersistence();
+  coord.dispose();
+
+  // Remontar y verificar persistencia completa de estilos, difuminado y encuadre CP-P02-B
+  const h2 = createHarness();
+  const coord2 = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h2.mediaDevices, mediaElements: h2.mediaElements },
+    surfaceFactory: h2.surfaces.factory,
+    scheduler: h2.scheduler,
+    now: h2.now,
+  });
+  await coord2.mount();
+  const restoredPipCam = coord2
+    .getProject()
+    .scenes.find((s) => s.presetId === 'ai-tutorial-pip')!
+    .layers.find((l) => l.sourceId === camSrcId)!;
+  assert.equal(restoredPipCam.style.maskShape, 'squircle');
+  assert.equal(restoredPipCam.style.borderEnabled, false);
+  assert.equal(restoredPipCam.style.featherPx, 26);
+  assert.equal(restoredPipCam.transform.aspectPreset, '1:1');
+  assert.equal(restoredPipCam.transform.contentZoom, 1.75);
+  assert.equal(restoredPipCam.transform.rotationDeg, 15);
+  coord2.dispose();
+});
+
+test('CP-P02-C1: Editor universal de ventana/pantalla/imagen (crop, zoom, proporción, estilo, bloqueo, persistencia por escena y cero reinicios)', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+  await coord.authorizeDisplaySource();
+
+  const gumBefore = h.getUserMediaCalls();
+  const gdmBefore = h.getDisplayMediaCalls();
+  const surfaceBefore = coord.getProgramSurface();
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const screenScene = coord.getProject().scenes.find((s) => s.presetId === 'fullscreen-demo')!;
+  const displaySrcId = coord.getProject().sources.find((s) => s.kind === 'window' || s.kind === 'screen')!.id;
+  const micSrcId = coord.getProject().sources.find((s) => s.kind === 'microphone')!.id;
+  const pipWindowLayer = pipScene.layers.find((l) => l.sourceId === displaySrcId)!;
+  const fullWindowLayer = screenScene.layers.find((l) => l.sourceId === displaySrcId)!;
+
+  // 1. Editar capa de ventana compartida (posición, tamaño libre, rotación, inversión, zoom interno, proporción y recorte 4 bordes)
+  const winTransformRes = coord.updateSceneLayerTransform(pipScene.id, pipWindowLayer.id, {
+    x: 0.05,
+    y: 0.06,
+    width: 0.85,
+    height: 0.78,
+    rotationDeg: 90,
+    flipH: true,
+    fitMode: 'contain',
+    aspectPreset: '16:9',
+    contentZoom: 1.6,
+    contentOffsetX: -0.25,
+    contentOffsetY: 0.3,
+    crop: { top: 0.08, right: 0.04, bottom: 0.06, left: 0.02 },
+  });
+  assert.equal(winTransformRes.ok, true);
+  assert.equal(winTransformRes.layer?.transform.crop.top, 0.08);
+  assert.equal(winTransformRes.layer?.transform.crop.right, 0.04);
+  assert.equal(winTransformRes.layer?.transform.contentZoom, 1.6);
+  assert.equal(winTransformRes.layer?.transform.rotationDeg, 90);
+  assert.equal(winTransformRes.layer?.transform.flipH, true);
+
+  // 2. Estilos completos sobre ventana compartida (squircle, borde opcional desactivado, sombra, difuminado y opacidad)
+  const winStyleRes = coord.updateSceneLayerStyle(pipScene.id, pipWindowLayer.id, {
+    maskShape: 'squircle',
+    borderRadiusPx: 32,
+    borderEnabled: false,
+    borderWidthPx: 6,
+    shadowBlurPx: 28,
+    shadowOpacity: 0.45,
+    featherPx: 16,
+    opacity: 0.9,
+  });
+  assert.equal(winStyleRes.ok, true);
+  assert.equal(winStyleRes.layer?.style.maskShape, 'squircle');
+  assert.equal(winStyleRes.layer?.style.borderEnabled, false);
+  assert.equal(winStyleRes.layer?.style.featherPx, 16);
+
+  // 3. Composición adaptable dirigida explícitamente a la ventana seleccionada y después vuelta al 100%
+  const cornerLayout = coord.applyAdaptableLayout(pipScene.id, 'corner-top-left', {
+    selectedLayerId: pipWindowLayer.id,
+  });
+  assert.equal(cornerLayout.ok, true);
+  const movedWin = coord
+    .getProject()
+    .scenes.find((s) => s.id === pipScene.id)!
+    .layers.find((l) => l.id === pipWindowLayer.id)!;
+  assert.ok(movedWin.transform.width < 0.6);
+
+  const fullLayout = coord.applyAdaptableLayout(pipScene.id, 'camera-full', {
+    selectedLayerId: pipWindowLayer.id,
+  });
+  assert.equal(fullLayout.ok, true);
+  const fullWin = coord
+    .getProject()
+    .scenes.find((s) => s.id === pipScene.id)!
+    .layers.find((l) => l.id === pipWindowLayer.id)!;
+  assert.equal(fullWin.transform.width, 1);
+  assert.equal(fullWin.transform.height, 1);
+
+  // 4. Escena fullscreen-demo mantiene sus propias coordenadas independientes de la misma fuente window
+  const fullSceneWinNow = coord
+    .getProject()
+    .scenes.find((s) => s.id === screenScene.id)!
+    .layers.find((l) => l.id === fullWindowLayer.id)!;
+  assert.equal(fullSceneWinNow.transform.crop.top, 0);
+  assert.equal(fullSceneWinNow.style.maskShape, 'rect');
+
+  // 5. Puente setProcessedCameraSurface nunca aplica filtros/IA a la ventana compartida
+  const processedCamStub = { width: 640, height: 360 };
+  coord.setProcessedCameraSurface({
+    surface: processedCamStub,
+    width: 640,
+    height: 360,
+    alphaMode: 'straight',
+    frameVersion: 99,
+  });
+  h.tickNextFrame(34);
+  const plan = coord.getCompositor()!.buildSceneRenderPlan(coord.getActiveScene()!);
+  const winCmd = plan.layers.find((l) => l.sourceKind === 'window' || l.sourceKind === 'screen')!;
+  assert.notEqual(winCmd.surface, processedCamStub);
+
+  // 6. Cero reinicios de pistas, cero stops y mismo ProgramCanvas
+  assert.equal(h.getUserMediaCalls(), gumBefore);
+  assert.equal(h.getDisplayMediaCalls(), gdmBefore);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+  assert.equal(coord.getProgramSurface(), surfaceBefore);
+
+  // 7. Bloqueo de ventana compartida e intento de transformación sobre fuente de audio
+  assert.equal(coord.setSceneLayerLocked(pipScene.id, pipWindowLayer.id, true), true);
+  assert.equal(
+    coord.updateSceneLayerTransform(pipScene.id, pipWindowLayer.id, { x: 0.2 }).ok,
+    false
+  );
+  assert.equal(coord.setSceneLayerLocked(pipScene.id, pipWindowLayer.id, false), true);
+
+  let projWithAudioOops = addLayerToScene(coord.getProject(), pipScene.id, micSrcId).project;
+  const audioOopsLayer = projWithAudioOops.scenes
+    .find((s) => s.id === pipScene.id)!
+    .layers.find((l) => l.sourceId === micSrcId)!;
+  await saveStudioProject(projWithAudioOops, h.storageAdapter);
+  const coordAudioCheck = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coordAudioCheck.mount();
+  const audioReject = coordAudioCheck.updateSceneLayerTransform(pipScene.id, audioOopsLayer.id, {
+    width: 0.5,
+  });
+  assert.equal(audioReject.ok, false);
+  coordAudioCheck.dispose();
+
+  // 8. Verificar persistencia completa de ventana editada tras remontar desde studioStorage
+  await coord.flushPersistence();
+  coord.dispose();
+
+  const h2 = createHarness();
+  const coord2 = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h2.mediaDevices, mediaElements: h2.mediaElements },
+    surfaceFactory: h2.surfaces.factory,
+    scheduler: h2.scheduler,
+    now: h2.now,
+  });
+  await coord2.mount();
+  const restoredWin = coord2
+    .getProject()
+    .scenes.find((s) => s.id === pipScene.id)!
+    .layers.find((l) => l.id === pipWindowLayer.id)!;
+  assert.equal(restoredWin.transform.crop.top, 0.08);
+  assert.equal(restoredWin.transform.crop.right, 0.04);
+  assert.equal(restoredWin.transform.contentZoom, 1.6);
+  assert.equal(restoredWin.transform.rotationDeg, 90);
+  assert.equal(restoredWin.style.maskShape, 'squircle');
+  assert.equal(restoredWin.style.featherPx, 16);
+  coord2.dispose();
+});
+
+test('CP-P02-C2 [1]: Reordenamiento de capas (drag/top/bottom/up/down) se refleja en ProgramCompositor sin reiniciar pistas ni ProgramCanvas', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+  await coord.authorizeDisplaySource();
+
+  const gumBefore = h.getUserMediaCalls();
+  const gdmBefore = h.getDisplayMediaCalls();
+  const surfaceBefore = coord.getProgramSurface();
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const camSrcId = coord.getProject().sources.find((s) => s.kind === 'camera')!.id;
+  const winSrcId = coord.getProject().sources.find((s) => s.kind === 'window' || s.kind === 'screen')!.id;
+  const camLayer = pipScene.layers.find((l) => l.sourceId === camSrcId)!;
+  const winLayer = pipScene.layers.find((l) => l.sourceId === winSrcId)!;
+
+  // Inicialmente la cámara está encima de la ventana
+  let plan = coord.getCompositor()!.buildSceneRenderPlan(coord.getActiveScene()!);
+  let camIdx = plan.layers.findIndex((l) => l.layerId === camLayer.id);
+  let winIdx = plan.layers.findIndex((l) => l.layerId === winLayer.id);
+  assert.ok(camIdx > winIdx);
+
+  // Enviar cámara al fondo
+  const moveBottom = coord.moveSceneLayerOrder(pipScene.id, camLayer.id, 'bottom');
+  assert.equal(moveBottom.ok, true);
+  plan = coord.getCompositor()!.buildSceneRenderPlan(coord.getActiveScene()!);
+  camIdx = plan.layers.findIndex((l) => l.layerId === camLayer.id);
+  winIdx = plan.layers.findIndex((l) => l.layerId === winLayer.id);
+  assert.ok(camIdx < winIdx);
+
+  // Subir un nivel con reorderSceneLayers y verificar orden exacto
+  const ascIds = coord
+    .getActiveScene()!
+    .layers.slice()
+    .sort((a, b) => a.zIndex - b.zIndex)
+    .map((l) => l.id);
+  const swapped = [...ascIds];
+  const camPos = swapped.indexOf(camLayer.id);
+  swapped.splice(camPos, 1);
+  swapped.push(camLayer.id);
+
+  const reordered = coord.reorderSceneLayers(pipScene.id, swapped);
+  assert.equal(reordered.ok, true);
+  plan = coord.getCompositor()!.buildSceneRenderPlan(coord.getActiveScene()!);
+  assert.equal(plan.layers[plan.layers.length - 1]?.layerId, camLayer.id);
+
+  // Continuidad estricta
+  assert.equal(h.getUserMediaCalls(), gumBefore);
+  assert.equal(h.getDisplayMediaCalls(), gdmBefore);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+  assert.equal(coord.getProgramSurface(), surfaceBefore);
+
+  coord.dispose();
+});
+
+test('CP-P02-C2 [2]: Ocultar/mostrar preserva transformaciones y pistas vivas y nunca dispara getDisplayMedia automático', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const camSrcId = coord.getProject().sources.find((s) => s.kind === 'camera')!.id;
+  const winSrcId = coord.getProject().sources.find((s) => s.kind === 'window' || s.kind === 'screen')!.id;
+  const camLayer = pipScene.layers.find((l) => l.sourceId === camSrcId)!;
+  const winLayer = pipScene.layers.find((l) => l.sourceId === winSrcId)!;
+
+  coord.updateSceneLayerTransform(pipScene.id, camLayer.id, { x: 0.2, y: 0.25, width: 0.32 });
+  coord.updateSceneLayerStyle(pipScene.id, camLayer.id, { maskShape: 'circle', featherPx: 14 });
+
+  const gumBefore = h.getUserMediaCalls();
+
+  // Ocultar cámara: omite render en plan, preserva transformación/estilo y NO detiene pista de cámara
+  const hideCam = await coord.setSceneLayerVisible(pipScene.id, camLayer.id, false);
+  assert.equal(hideCam.ok, true);
+  let plan = coord.getCompositor()!.buildSceneRenderPlan(coord.getActiveScene()!);
+  assert.equal(plan.layers.some((l) => l.layerId === camLayer.id), false);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+  assert.equal(coord.sourceManager.getEntry(camSrcId)?.state.status, 'live');
+
+  // Volver a mostrar cámara: conserva transform y estilo sin reiniciar getUserMedia
+  const showCam = await coord.setSceneLayerVisible(pipScene.id, camLayer.id, true);
+  assert.equal(showCam.ok, true);
+  assert.equal(showCam.layer?.transform.width, 0.32);
+  assert.equal(showCam.layer?.style.maskShape, 'circle');
+  assert.equal(h.getUserMediaCalls(), gumBefore);
+
+  // Ocultar y mostrar capa window que aún no fue autorizada NUNCA debe disparar getDisplayMedia
+  assert.equal(h.getDisplayMediaCalls(), 0);
+  await coord.setSceneLayerVisible(pipScene.id, winLayer.id, false);
+  await coord.setSceneLayerVisible(pipScene.id, winLayer.id, true);
+  assert.equal(h.getDisplayMediaCalls(), 0);
+
+  coord.dispose();
+});
+
+test('CP-P02-C2 [3]: Duplicar capa comparte sourceId, eliminar de escena conserva fuente y eliminación segura bloquea en uso', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const camSrcId = coord.getProject().sources.find((s) => s.kind === 'camera')!.id;
+  const camLayer = pipScene.layers.find((l) => l.sourceId === camSrcId)!;
+  const sourcesBefore = coord.getProject().sources.length;
+
+  const dup = coord.duplicateSceneLayer(pipScene.id, camLayer.id);
+  assert.equal(dup.ok, true);
+  assert.ok(dup.layer);
+  assert.equal(dup.layer.sourceId, camSrcId);
+  assert.notEqual(dup.layer.id, camLayer.id);
+  assert.equal(coord.getProject().sources.length, sourcesBefore);
+
+  // Edición independiente de la copia
+  coord.updateSceneLayerTransform(pipScene.id, dup.layer.id, { x: 0.05, y: 0.05, width: 0.25 });
+  const origNow = coord
+    .getActiveScene()!
+    .layers.find((l) => l.id === camLayer.id)!;
+  assert.notEqual(origNow.transform.x, 0.05);
+
+  // Eliminar capa duplicada de la escena NO elimina la fuente ni detiene tracks
+  const rmDup = coord.removeSceneLayer(pipScene.id, dup.layer.id);
+  assert.equal(rmDup.ok, true);
+  assert.equal(coord.getProject().sources.some((s) => s.id === camSrcId), true);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+
+  // Intentar eliminar del proyecto una fuente aún usada debe ser rechazado
+  const blockedDelete = await coord.removeProjectSourceSafely(camSrcId);
+  assert.equal(blockedDelete.ok, false);
+  assert.match(blockedDelete.reason ?? '', /en uso/i);
+
+  // Añadir imagen real al proyecto y quitar su capa para probar eliminación segura de fuente huérfana + asset blob
+  const imgBlob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/png' });
+  const addedImg = await coord.addRealSourceToScene(pipScene.id, {
+    kind: 'image',
+    name: 'Logo Prueba.png',
+    file: imgBlob,
+  });
+  assert.equal(addedImg.ok, true);
+  assert.ok(addedImg.source && addedImg.layer);
+  const assetRef =
+    addedImg.source.kind === 'image' ? addedImg.source.assetRef : '';
+  assert.ok(await loadStudioAssetBlob(assetRef));
+
+  assert.equal(coord.removeSceneLayer(pipScene.id, addedImg.layer.id).ok, true);
+  const cleanDelete = await coord.removeProjectSourceSafely(addedImg.source.id);
+  assert.equal(cleanDelete.ok, true);
+  assert.equal(
+    coord.getProject().sources.some((s) => s.id === addedImg.source!.id),
+    false
+  );
+  assert.equal(await loadStudioAssetBlob(assetRef), null);
+
+  coord.dispose();
+});
+
+test('CP-P02-C2 [4]: Añadir fuentes reales (imagen, vídeo, audio, texto, color, degradado), cancelación honesta y persistencia', async () => {
+  const h = createHarness();
+  const baseMedia = h.mediaDevices;
+  const abortingMedia: MediaDevicesAdapter = {
+    ...baseMedia,
+    async getDisplayMedia() {
+      const err = new Error('User canceled screen picker');
+      err.name = 'AbortError';
+      throw err;
+    },
+  };
+
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: abortingMedia, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+
+  const sceneId = coord.getActiveScene()!.id;
+  const sourcesCountBefore = coord.getProject().sources.length;
+  const layersCountBefore = coord.getActiveScene()!.layers.length;
+
+  // Cancelar selector de pantalla NO crea fuentes rotas ni capa vacía
+  const canceledWin = await coord.addRealSourceToScene(sceneId, { kind: 'window' });
+  assert.equal(canceledWin.ok, false);
+  assert.equal(canceledWin.canceled, true);
+  assert.equal(coord.getProject().sources.length, sourcesCountBefore);
+  assert.equal(coord.getActiveScene()!.layers.length, layersCountBefore);
+
+  // Audio del sistema sin stream display con audio activo reporta estado honesto sin simular
+  const sysAudioAttempt = await coord.addRealSourceToScene(sceneId, {
+    kind: 'system-audio',
+  });
+  assert.equal(sysAudioAttempt.ok, false);
+  assert.match(sysAudioAttempt.reason ?? '', /macOS|audio|captura|loopback/i);
+
+  // Añadir texto, color, degradado, imagen y vídeo real
+  const txtRes = await coord.addRealSourceToScene(sceneId, {
+    kind: 'text',
+    text: 'Óptica Live',
+    subtitle: 'Demo ARM64',
+  });
+  assert.equal(txtRes.ok, true);
+
+  const colRes = await coord.addRealSourceToScene(sceneId, {
+    kind: 'color',
+    color: '#0F172A',
+  });
+  assert.equal(colRes.ok, true);
+
+  const gradRes = await coord.addRealSourceToScene(sceneId, {
+    kind: 'gradient',
+    startColor: '#0B1220',
+    endColor: '#1D4ED8',
+    angleDeg: 120,
+  });
+  assert.equal(gradRes.ok, true);
+
+  const vidRes = await coord.addRealSourceToScene(sceneId, {
+    kind: 'video-file',
+    name: 'clip.mp4',
+    file: new Blob([new Uint8Array([5, 6, 7])], { type: 'video/mp4' }),
+  });
+  assert.equal(vidRes.ok, true);
+
+  const audRes = await coord.addRealSourceToScene(sceneId, {
+    kind: 'audio-file',
+    name: 'voz.m4a',
+    file: new Blob([new Uint8Array([8, 9])], { type: 'audio/mp4' }),
+  });
+  assert.equal(audRes.ok, true);
+  assert.ok(audRes.source);
+  // Fuentes solo audio van a audioSourceIds sin crear capa visual geométrica
+  assert.equal(audRes.layer, null);
+  assert.equal(
+    coord.getActiveScene()!.audioSourceIds.includes(audRes.source.id),
+    true
+  );
+
+  // Render y persistencia completa tras recarga
+  h.tickNextFrame(34);
+  await coord.flushPersistence();
+  coord.dispose();
+
+  const coord2 = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: baseMedia, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord2.mount();
+  const restoredScene = coord2.getActiveScene()!;
+  assert.equal(
+    restoredScene.layers.some((l) => l.id === txtRes.layer!.id),
+    true
+  );
+  assert.equal(
+    restoredScene.layers.some((l) => l.id === vidRes.layer!.id),
+    true
+  );
+  assert.equal(
+    restoredScene.layers.some((l) => l.id === gradRes.layer!.id),
+    true
+  );
+  coord2.dispose();
+});
+
+test('CP-P02-C2 [5]: Historial acotado Undo/Redo (gestos agrupados, límite, persistencia y cero llamadas a hardware)', async () => {
+  // Probar acotamiento estricto en CompositionHistory (mínimo permitido: 5)
+  const bounded = new CompositionHistory({ maxEntries: 5 });
+  let currentProj = createStarterStudioProject('1080p', '16:9');
+  for (let i = 1; i <= 7; i++) {
+    const prev = cloneCompositionSnapshot(currentProj);
+    currentProj = {
+      ...currentProj,
+      scenes: currentProj.scenes.map((s, idx) =>
+        idx === 0 ? { ...s, name: `Estado ${i}` } : s
+      ),
+    };
+    const next = cloneCompositionSnapshot(currentProj);
+    bounded.recordChange(prev, next, {
+      label: `Cambio ${i}`,
+      now: i * 5000,
+    });
+  }
+  assert.equal(bounded.getStatus().undoCount, 5);
+
+  // Probar integración completa en StudioCoordinator
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+  await coord.authorizeDisplaySource();
+
+  const gumBefore = h.getUserMediaCalls();
+  const gdmBefore = h.getDisplayMediaCalls();
+
+  const pipScene = coord.getProject().scenes.find((s) => s.presetId === 'ai-tutorial-pip')!;
+  const camSrcId = coord.getProject().sources.find((s) => s.kind === 'camera')!.id;
+  const camLayer = pipScene.layers.find((l) => l.sourceId === camSrcId)!;
+  const origX = camLayer.transform.x;
+  const origName = camLayer.name;
+  const origMaskShape = camLayer.style.maskShape;
+
+  // 1. Gesto continuo agrupado de arrastre (10 updates -> 1 entrada en historial)
+  coord.beginCompositionGesture('Mover capa');
+  for (let i = 1; i <= 8; i++) {
+    coord.updateSceneLayerTransform(pipScene.id, camLayer.id, {
+      x: Number((0.1 + i * 0.02).toFixed(3)),
+    });
+  }
+  coord.commitCompositionGesture();
+  assert.equal(coord.getHistoryStatus().undoCount, 1);
+
+  // 2. Cambio de estilo + renombrado
+  coord.updateSceneLayerStyle(pipScene.id, camLayer.id, { maskShape: 'circle' });
+  coord.renameSceneLayer(pipScene.id, camLayer.id, 'Cam Redonda');
+  assert.equal(coord.getHistoryStatus().undoCount, 3);
+
+  // Deshacer renombrado -> estilo -> arrastre entero de una vez
+  const u1 = await coord.undoComposition();
+  assert.equal(u1.ok, true);
+  assert.equal(
+    coord.getActiveScene()!.layers.find((l) => l.id === camLayer.id)?.name,
+    origName
+  );
+
+  const u2 = await coord.undoComposition();
+  assert.equal(u2.ok, true);
+  assert.equal(
+    coord.getActiveScene()!.layers.find((l) => l.id === camLayer.id)?.style.maskShape,
+    origMaskShape
+  );
+
+  const u3 = await coord.undoComposition();
+  assert.equal(u3.ok, true);
+  assert.equal(
+    coord.getActiveScene()!.layers.find((l) => l.id === camLayer.id)?.transform.x,
+    origX
+  );
+
+  // Rehacer el arrastre completo y el estilo
+  const r1 = await coord.redoComposition();
+  assert.equal(r1.ok, true);
+  assert.ok(
+    Math.abs(
+      (coord.getActiveScene()!.layers.find((l) => l.id === camLayer.id)?.transform.x ?? 0) -
+        0.26
+    ) < 1e-4
+  );
+
+  const r2 = await coord.redoComposition();
+  assert.equal(r2.ok, true);
+  assert.equal(
+    coord.getActiveScene()!.layers.find((l) => l.id === camLayer.id)?.style.maskShape,
+    'circle'
+  );
+
+  // Undo/Redo jamás reabre hardware ni detiene tracks
+  assert.equal(h.getUserMediaCalls(), gumBefore);
+  assert.equal(h.getDisplayMediaCalls(), gdmBefore);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+
+  // Verificar que Undo/Redo persiste en studioStorage
+  await coord.flushPersistence();
+  coord.dispose();
+
+  const coord2 = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord2.mount();
+  const persisted = coord2
+    .getProject()
+    .scenes.find((s) => s.id === pipScene.id)!
+    .layers.find((l) => l.id === camLayer.id)!;
+  assert.equal(persisted.style.maskShape, 'circle');
+  assert.ok(Math.abs(persisted.transform.x - 0.26) < 1e-4);
+  coord2.dispose();
+});
+
+test('C3-R1: pantalla nueva detrás de cámara, misma escena, composición PiP corrige profundidad y permite deshacer', async () => {
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio', storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory, scheduler: h.scheduler, now: h.now,
+  });
+  await coord.mount();
+  const before = coord.getActiveScene()!;
+  const camera = before.layers.find(l=>coord.getProject().sources.some(s=>s.id===l.sourceId && s.kind==='camera'))!;
+  assert.ok(camera);
+  const surface=coord.getProgramSurface();
+  const gum=h.getUserMediaCalls(),gdm=h.getDisplayMediaCalls();
+  const result=await coord.addRealSourceToScene(before.id,{kind:'screen',placement:'behind-camera',includeSystemAudio:false});
+  assert.equal(result.ok,true);
+  assert.equal(coord.getActiveScene()!.id,before.id);
+  const screen=result.layer!;
+  const order=()=>coord.getActiveScene()!.layers.slice().sort((a,b)=>a.zIndex-b.zIndex).map(l=>l.id);
+  assert.ok(order().indexOf(screen.id)<order().indexOf(camera.id));
+  assert.equal(h.getDisplayMediaCalls(),gdm+1);
+  coord.moveSceneLayerOrder(before.id,screen.id,'top');
+  assert.ok(order().indexOf(screen.id)>order().indexOf(camera.id));
+  const lay=coord.applyAdaptableLayout(before.id,'screen-main-cam-pip',{participatingLayerIds:[camera.id,screen.id]});
+  assert.equal(lay.ok,true);
+  assert.ok(order().indexOf(screen.id)<order().indexOf(camera.id));
+  assert.equal((await coord.undoComposition()).ok,true);
+  assert.ok(order().indexOf(screen.id)>order().indexOf(camera.id));
+  assert.equal(h.getDisplayMediaCalls(),gdm+1);
+  assert.equal(h.getUserMediaCalls(),gum);
+  assert.equal(coord.getProgramSurface(),surface);
+  coord.dispose();
+});
+
+test('CP-P02-C3-R2: múltiples pantallas y ventanas simultáneas, renombrado, reutilización detrás de cámara, cambio sin perder stream al cancelar y cero recuadros en visor', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const h = createHarness();
+  const coord = new StudioCoordinator({
+    initialMode: 'studio',
+    storageAdapter: h.storageAdapter,
+    sourceManagerOptions: { mediaDevices: h.mediaDevices, mediaElements: h.mediaElements },
+    surfaceFactory: h.surfaces.factory,
+    scheduler: h.scheduler,
+    now: h.now,
+  });
+  await coord.mount();
+
+  const scene1 = coord.getActiveScene()!;
+  const cameraLayer = scene1.layers.find((l) =>
+    coord.getProject().sources.some((s) => s.id === l.sourceId && s.kind === 'camera')
+  )!;
+  assert.ok(cameraLayer);
+
+  const surfaceBefore = coord.getProgramSurface();
+  const gumBefore = h.getUserMediaCalls();
+
+  // 1. Añadir simultáneamente una Pantalla y una Ventana reales detrás de la cámara en la misma escena
+  const addScreenRes = await coord.addRealSourceToScene(scene1.id, {
+    kind: 'screen',
+    placement: 'behind-camera',
+    includeSystemAudio: false,
+  });
+  assert.equal(addScreenRes.ok, true);
+  assert.ok(addScreenRes.source && addScreenRes.layer);
+
+  const addWindowRes = await coord.addRealSourceToScene(scene1.id, {
+    kind: 'window',
+    placement: 'behind-camera',
+    includeSystemAudio: false,
+  });
+  assert.equal(addWindowRes.ok, true);
+  assert.ok(addWindowRes.source && addWindowRes.layer);
+
+  const scrSrc = addScreenRes.source!;
+  const scrLayer = addScreenRes.layer!;
+  const winSrc = addWindowRes.source!;
+  const winLayer = addWindowRes.layer!;
+
+  assert.notEqual(scrSrc.id, winSrc.id);
+  assert.notEqual(scrLayer.id, winLayer.id);
+
+  // Ambas quedan detrás de la cámara por defecto
+  const getOrder = (scId: string) =>
+    coord
+      .getProject()
+      .scenes.find((s) => s.id === scId)!
+      .layers.slice()
+      .sort((a, b) => a.zIndex - b.zIndex)
+      .map((l) => l.id);
+
+  const order1 = getOrder(scene1.id);
+  assert.ok(order1.indexOf(scrLayer.id) < order1.indexOf(cameraLayer.id));
+  assert.ok(order1.indexOf(winLayer.id) < order1.indexOf(cameraLayer.id));
+
+  // 2. Renombrar fuente no destructivamente sin reiniciar streams ni ProgramCanvas
+  const renameRes = coord.renameProjectSource(winSrc.id, 'Editor VS Code');
+  assert.equal(renameRes.ok, true);
+  assert.equal(renameRes.source?.name, 'Editor VS Code');
+  assert.equal(coord.getProgramSurface(), surfaceBefore);
+  assert.equal(h.createdTracks.every((t) => t.stopCount === 0), true);
+
+  // 3. Subir ventana al frente y devolverla 1-clic detrás de la cámara con placeSceneLayerBehindCamera
+  coord.moveSceneLayerOrder(scene1.id, winLayer.id, 'top');
+  let curOrder = getOrder(scene1.id);
+  assert.ok(curOrder.indexOf(winLayer.id) > curOrder.indexOf(cameraLayer.id));
+
+  coord.placeSceneLayerBehindCamera(scene1.id, winLayer.id);
+  curOrder = getOrder(scene1.id);
+  assert.ok(curOrder.indexOf(winLayer.id) < curOrder.indexOf(cameraLayer.id));
+
+  // 4. Composición explícita Principal/Secundaria (screen-main-window-pip) + Undo sin reabrir hardware
+  const gdmAfterAdds = h.getDisplayMediaCalls();
+  const compRes = coord.applyAdaptableLayout(scene1.id, 'screen-main-window-pip', {
+    primaryDisplayLayerId: winLayer.id,
+    secondaryDisplayLayerId: scrLayer.id,
+    primaryCameraLayerId: cameraLayer.id,
+  });
+  assert.equal(compRes.ok, true);
+  const activeLayersAfterComp = coord.getActiveScene()!.layers;
+  const winAfterComp = activeLayersAfterComp.find((l) => l.id === winLayer.id)!;
+  const scrAfterComp = activeLayersAfterComp.find((l) => l.id === scrLayer.id)!;
+  const camAfterComp = activeLayersAfterComp.find((l) => l.id === cameraLayer.id)!;
+  assert.ok(winAfterComp.zIndex < scrAfterComp.zIndex && scrAfterComp.zIndex < camAfterComp.zIndex);
+  assert.ok(winAfterComp.transform.width >= 0.99);
+  assert.ok(scrAfterComp.transform.width < 0.4);
+
+  assert.equal((await coord.undoComposition()).ok, true);
+  assert.equal(h.getDisplayMediaCalls(), gdmAfterAdds);
+  assert.equal(h.getUserMediaCalls(), gumBefore);
+
+  // 5. Reutilizar fuente existente en otra escena detrás de cámara sin pedir getDisplayMedia otra vez
+  const secondScene = coord.getProject().scenes.find((s) => s.id !== scene1.id)!;
+  const reuseRes = await coord.addExistingSourceToScene(secondScene.id, scrSrc.id, {
+    placement: 'behind-camera',
+  });
+  assert.equal(reuseRes.ok, true);
+  assert.equal(reuseRes.source?.id, scrSrc.id);
+  assert.notEqual(reuseRes.layer?.id, scrLayer.id);
+  assert.equal(h.getDisplayMediaCalls(), gdmAfterAdds);
+
+  // 6. Cambiar captura en vivo y cancelar el selector conserva la captura activa original
+  const originalStreamId = addScreenRes.entry?.resources.mediaStream?.id;
+  assert.ok(originalStreamId);
+
+  const origGetDisplayMedia = h.mediaDevices.getDisplayMedia;
+  h.mediaDevices.getDisplayMedia = async () => {
+    const err = new Error('User canceled picker');
+    err.name = 'NotAllowedError';
+    throw err;
+  };
+  const canceledEntry = await coord.reconnectSource(scrSrc.id, true);
+  assert.equal(canceledEntry?.state.status, 'live');
+  assert.equal(canceledEntry?.details.errorCode, 'user-canceled');
+  assert.equal(canceledEntry?.resources.mediaStream?.id, originalStreamId);
+  assert.equal(coord.getProgramSurface(), surfaceBefore);
+  h.mediaDevices.getDisplayMedia = origGetDisplayMedia;
+
+  // 7. Regla permanente: CameraViewport jamás renderiza recuadros de detección de sujetos sobre la escena
+  const viewportSource = fs.readFileSync(
+    path.resolve(process.cwd(), 'src/components/CameraViewport.tsx'),
+    'utf8'
+  );
+  assert.equal(viewportSource.includes('Sujeto 1'), false);
+  assert.equal(viewportSource.includes('detectedSubjects'), false);
+
   coord.dispose();
 });

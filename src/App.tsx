@@ -67,6 +67,10 @@ import {
 } from './engine/engineCompatibility';
 import type { PreferredCompositorBackend } from './engine/studioCoordinator';
 import type { MediaStreamLike } from './engine/sourceManager';
+import {
+  computeKeyboardNudgeTransform,
+  isVisualSourceEditable,
+} from './engine/layerEditor';
 import { useStudioEngine } from './hooks/useStudioEngine';
 import { useAppearance } from './hooks/useAppearance';
 
@@ -330,6 +334,7 @@ export default function App() {
     dest: MediaStreamAudioDestinationNode;
     micSource: MediaStreamAudioSourceNode;
     screenAudioSource?: MediaStreamAudioSourceNode;
+    displayAudioSources?: Map<string, MediaStreamAudioSourceNode>;
     data: Uint8Array<ArrayBuffer>;
   } | null>(null);
 
@@ -377,6 +382,28 @@ export default function App() {
     return canvasRef.current;
   }, []);
 
+  const [selectedStudioLayerId, setSelectedStudioLayerId] = useState<string | null>(null);
+
+  const activeStudioScene = useMemo(
+    () =>
+      studioEngine.scenes.find((s) => s.id === studioEngine.activeSceneId) ?? null,
+    [studioEngine.scenes, studioEngine.activeSceneId]
+  );
+
+  useEffect(() => {
+    if (studioEngine.engineMode !== 'studio') {
+      setSelectedStudioLayerId(null);
+      return;
+    }
+    if (!selectedStudioLayerId) return;
+    const stillValid = activeStudioScene?.layers.some(
+      (l) => l.id === selectedStudioLayerId && l.visible
+    );
+    if (!stillValid) {
+      setSelectedStudioLayerId(null);
+    }
+  }, [studioEngine.engineMode, activeStudioScene, selectedStudioLayerId]);
+
   const dims = useMemo(
     () => getDimensions(resolutionPreset, aspectRatio, sensorSize),
     [resolutionPreset, aspectRatio, sensorSize]
@@ -409,12 +436,10 @@ export default function App() {
   }, [focus.aiTrackingEnabled, focus.aiAutoFocus]);
 
   useEffect(() => {
-    if ((background.mode !== 'none' || activeTab === 'filters') && background.useAi) {
+    if (background.mode === 'transparent' || ((background.mode !== 'none' || activeTab === 'filters') && background.useAi)) {
       void ensureAiSegmenter();
     }
-    if (background.mode === 'none') {
-      resetAiSegmentationTemporalBuffer();
-    }
+    resetAiSegmentationTemporalBuffer();
   }, [background.mode, background.useAi, activeTab]);
 
   const refreshDevices = useCallback(async (): Promise<{
@@ -1249,36 +1274,103 @@ export default function App() {
     return () => clearInterval(id);
   }, [isRecording, isRecordingPaused]);
 
-  const routeDisplayAudioToMixer = useCallback((sStream: MediaStream) => {
-    if (sStream.getAudioTracks().length === 0 || !audioAnalyserRef.current) return;
-    const graph = audioAnalyserRef.current;
-    if (graph.screenAudioSource) {
-      try {
-        graph.screenAudioSource.disconnect();
-      } catch {
-        // Ignore
+  const routeDisplayAudioToMixer = useCallback(
+    (sStream: MediaStream, sourceKey = 'legacy-display') => {
+      if (sStream.getAudioTracks().length === 0 || !audioAnalyserRef.current) return;
+      const graph = audioAnalyserRef.current;
+      if (!graph.displayAudioSources) {
+        graph.displayAudioSources = new Map();
       }
-      graph.screenAudioSource = undefined;
-    }
-    try {
-      const sSrc = graph.ctx.createMediaStreamSource(sStream);
-      sSrc.connect(graph.analyser);
-      sSrc.connect(graph.dest);
-      graph.screenAudioSource = sSrc;
-    } catch {
-      // Ignore if display stream audio track cannot be routed
-    }
-  }, []);
+      const prevNode = graph.displayAudioSources.get(sourceKey);
+      if (prevNode) {
+        try {
+          prevNode.disconnect();
+        } catch {
+          // Ignore
+        }
+        graph.displayAudioSources.delete(sourceKey);
+      }
+      if (sourceKey === 'legacy-display' && graph.screenAudioSource) {
+        try {
+          graph.screenAudioSource.disconnect();
+        } catch {
+          // Ignore
+        }
+        graph.screenAudioSource = undefined;
+      }
+      try {
+        const sSrc = graph.ctx.createMediaStreamSource(sStream);
+        sSrc.connect(graph.analyser);
+        sSrc.connect(graph.dest);
+        graph.displayAudioSources.set(sourceKey, sSrc);
+        if (sourceKey === 'legacy-display') {
+          graph.screenAudioSource = sSrc;
+        }
+      } catch {
+        // Ignore if display stream audio track cannot be routed
+      }
+    },
+    []
+  );
 
   // Screen Share + Camera PiP (+ optional shared system/tab audio into Web Audio mixer)
   const toggleScreenPip = useCallback(async () => {
     if (engineModeRef.current === 'studio') {
-      const entry = await studioEngineRef.current.authorizeDisplaySource();
-      if (entry?.state.status === 'live' && entry.resources.mediaStream) {
-        routeDisplayAudioToMixer(entry.resources.mediaStream as MediaStream);
-        showToast('Pantalla o ventana conectada');
+      const engine = studioEngineRef.current;
+      const project = engine.getProject();
+      const scene = project.scenes.find((s) => s.id === project.activeSceneId);
+      if (!scene) {
+        showToast('No hay una escena activa.');
+        return;
+      }
+      const existing = [...scene.layers]
+        .sort((a, b) => b.zIndex - a.zIndex)
+        .find((l) =>
+          l.visible &&
+          project.sources.some(
+            (s) => s.id === l.sourceId && (s.kind === 'screen' || s.kind === 'window')
+          )
+        );
+      let entry;
+      let layerId = existing?.id;
+      if (existing) {
+        entry =
+          engine
+            .getActiveSourceRuntimeEntries()
+            .find((e) => e.source.id === existing.sourceId && e.state.status === 'live') ??
+          (await engine.authorizeDisplaySource(existing.sourceId));
       } else {
-        showToast(entry?.state.errorMessage || 'No se pudo conectar la pantalla. Selecciona una escena de Tutorial PiP o Solo Pantalla y comprueba los permisos de macOS.');
+        const result = await engine.addRealSourceToScene(scene.id, {
+          kind: 'screen',
+          includeSystemAudio: audioConsole.includeSystemAudio,
+          placement: 'behind-camera',
+        });
+        if (!result.ok) {
+          if (result.canceled) {
+            showToast('Selección de pantalla cancelada.');
+          } else {
+            showToast(result.reason || 'No se pudo añadir la pantalla.');
+          }
+          return;
+        }
+        entry = result.entry;
+        layerId = result.layer?.id;
+      }
+      if (entry?.state.status === 'live' && entry.resources.mediaStream) {
+        routeDisplayAudioToMixer(
+          entry.resources.mediaStream as MediaStream,
+          entry.source.id
+        );
+        if (layerId) setSelectedStudioLayerId(layerId);
+        appearance.updateLeftPanel({ expanded: true, activeSection: 'layers' });
+        showToast('Pantalla conectada detrás de cámara');
+      } else if (entry?.details.errorCode === 'user-canceled') {
+        showToast('Selección de pantalla cancelada.');
+      } else {
+        showToast(
+          entry?.state.errorMessage ||
+            'No se pudo conectar la pantalla. Comprueba los permisos de macOS.'
+        );
       }
       return;
     }
@@ -1345,7 +1437,7 @@ export default function App() {
         ? 'Captura cancelada o permiso denegado. Revisa Privacidad y seguridad → Grabación de pantalla y audio del sistema.'
         : `No se pudo compartir pantalla (${name}). Intenta nuevamente.`);
     }
-  }, [isScreenPipActive, audioConsole.includeSystemAudio, routeDisplayAudioToMixer, showToast]);
+  }, [isScreenPipActive, audioConsole.includeSystemAudio, routeDisplayAudioToMixer, showToast, appearance.updateLeftPanel]);
 
   // Native System Floating Window (Output Picture-in-Picture)
   const toggleOutputPip = useCallback(async () => {
@@ -1381,34 +1473,76 @@ export default function App() {
     }
   }, [getOutputCaptureCanvas, showToast]);
 
-  const handleAuthorizeStudioDisplaySource = useCallback(async () => {
-    const entry = await studioEngine.authorizeDisplaySource();
-    if (!entry || entry.state.status !== 'live') {
-      showToast(entry?.state.errorMessage || 'No hay una fuente de pantalla disponible en la escena. Selecciona Tutorial PiP o Solo Pantalla.');
-      return;
-    }
-    const stream = entry.resources.mediaStream as MediaStream | null;
-    if (stream && stream.getAudioTracks().length > 0 && audioAnalyserRef.current) {
-      const graph = audioAnalyserRef.current;
-      if (graph.screenAudioSource) {
-        try {
-          graph.screenAudioSource.disconnect();
-        } catch {
-          // Ignore
+  const handleAuthorizeStudioDisplaySource = useCallback(
+    async (preferredSourceId?: string) => {
+      if (engineModeRef.current !== 'studio') return;
+      if (!preferredSourceId) {
+        await toggleScreenPip();
+        return;
+      }
+      const engine = studioEngineRef.current;
+      const entry =
+        (await engine.authorizeDisplaySource(preferredSourceId)) ??
+        (await engine.reconnectSource(preferredSourceId, true));
+      if (entry?.state.status === 'live' && entry.resources.mediaStream) {
+        routeDisplayAudioToMixer(
+          entry.resources.mediaStream as MediaStream,
+          entry.source.id
+        );
+        const scene = engine.getProject().scenes.find((s) => s.id === engine.getProject().activeSceneId);
+        const matchedLayer = scene?.layers.find((l) => l.sourceId === entry.source.id);
+        if (matchedLayer) setSelectedStudioLayerId(matchedLayer.id);
+        showToast(`Captura activa: ${entry.source.name}`);
+      } else if (entry?.details.errorCode === 'user-canceled') {
+        showToast('Selección cancelada · se conservó la fuente actual.');
+      } else if (entry?.state.errorMessage) {
+        showToast(entry.state.errorMessage);
+      }
+    },
+    [routeDisplayAudioToMixer, showToast, toggleScreenPip]
+  );
+
+  const handleAddStudioDisplaySource = useCallback(
+    async (kind: 'screen' | 'window') => {
+      if (engineModeRef.current !== 'studio') return;
+      const engine = studioEngineRef.current;
+      const project = engine.getProject();
+      const scene = project.scenes.find((s) => s.id === project.activeSceneId);
+      if (!scene) {
+        showToast('No hay una escena activa.');
+        return;
+      }
+      const result = await engine.addRealSourceToScene(scene.id, {
+        kind,
+        includeSystemAudio: audioConsole.includeSystemAudio,
+        placement: 'behind-camera',
+      });
+      if (!result.ok) {
+        if (result.canceled) {
+          showToast('Selección cancelada.');
+        } else {
+          showToast(
+            result.reason ||
+              (kind === 'window'
+                ? 'No se pudo añadir la ventana.'
+                : 'No se pudo añadir la pantalla.')
+          );
         }
-        graph.screenAudioSource = undefined;
+        return;
       }
-      try {
-        const sSrc = graph.ctx.createMediaStreamSource(stream);
-        sSrc.connect(graph.analyser);
-        sSrc.connect(graph.dest);
-        graph.screenAudioSource = sSrc;
-      } catch {
-        // Ignore routing errors
+      if (result.entry?.resources.mediaStream) {
+        routeDisplayAudioToMixer(
+          result.entry.resources.mediaStream as MediaStream,
+          result.entry.source.id
+        );
       }
-    }
-    showToast('Pantalla o ventana conectada');
-  }, [studioEngine, showToast]);
+      if (result.layer) {
+        setSelectedStudioLayerId(result.layer.id);
+      }
+      showToast(`${result.source?.name ?? 'Fuente'} añadida detrás de la cámara`);
+    },
+    [audioConsole.includeSystemAudio, routeDisplayAudioToMixer, showToast]
+  );
 
   const handleSwitchEngineMode = useCallback(
     async (nextMode: EngineMode) => {
@@ -1849,10 +1983,13 @@ export default function App() {
               const bridgeSrc = camVid;
               const bSrcW = camVid.videoWidth;
               const bSrcH = camVid.videoHeight;
+              const swapBridgeDims = s.rotation === 90 || s.rotation === 270;
+              const effectiveSrcW = swapBridgeDims ? bSrcH : bSrcW;
+              const effectiveSrcH = swapBridgeDims ? bSrcW : bSrcH;
 
               const procCanvas = processedCameraCanvasRef.current!;
-              const procW = Math.min(1280, Math.max(640, bSrcW));
-              const procH = Math.round(procW * (bSrcH / Math.max(1, bSrcW)));
+              const procW = Math.min(s.background.mode === 'transparent' ? 1920 : 1280, effectiveSrcW);
+              const procH = Math.round(procW * (effectiveSrcH / Math.max(1, effectiveSrcW)));
               if (procCanvas.width !== procW || procCanvas.height !== procH) {
                 procCanvas.width = procW;
                 procCanvas.height = procH;
@@ -1860,7 +1997,7 @@ export default function App() {
               const procCtx = procCanvas.getContext('2d');
               if (procCtx) {
                 // Solo procesa la capa de cámara; jamás aplica filtros a la ventana compartida
-                renderCameraFrame(
+                const hasTransparentSubject = renderCameraFrame(
                   procCtx,
                   bridgeSrc,
                   bSrcW,
@@ -1868,6 +2005,7 @@ export default function App() {
                   {
                     width: procW,
                     height: procH,
+                    cameraOnlyAlpha: true,
                     mirror: s.mirror,
                     flipVertical: s.flipVertical,
                     rotation: s.rotation,
@@ -1903,11 +2041,13 @@ export default function App() {
                   surface: procCanvas,
                   width: procW,
                   height: procH,
-                  alphaMode: 'straight',
+                  alphaMode: hasTransparentSubject ? 'premultiplied' : 'straight',
                   frameVersion: processedCameraVersionRef.current,
+                  hasTransparentSubject,
                 });
               }
             } else {
+              resetAiSegmentationTemporalBuffer();
               coordEngine.setProcessedCameraSurface(null);
             }
 
@@ -2109,15 +2249,86 @@ export default function App() {
     return () => cancelAnimationFrame(rafId);
   }, []);
 
-  // Keyboard shortcuts (Space, R, M, F, G, L, H, C, Escape)
+  // Keyboard shortcuts (Space, R, M, F, G, L, H, C, Escape, Arrow nudges for Studio camera layer)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
-      if (e.key === 'Escape' && cinemaMode) {
-        setCinemaMode(false);
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        e.key.toLowerCase() === 'z' &&
+        studioEngine.engineMode === 'studio' &&
+        activeTab !== 'gallery'
+      ) {
+        e.preventDefault();
+        if (e.shiftKey) {
+          void studioEngine.redoComposition().then((res) => {
+            if (res.ok) {
+              showToast(`Rehacer: ${res.label ?? 'composición'}`);
+            }
+          });
+        } else {
+          void studioEngine.undoComposition().then((res) => {
+            if (res.ok) {
+              showToast(`Deshacer: ${res.label ?? 'composición'}`);
+            }
+          });
+        }
         return;
+      }
+
+      if (e.key === 'Escape') {
+        if (cinemaMode) {
+          setCinemaMode(false);
+          return;
+        }
+        if (selectedStudioLayerId) {
+          setSelectedStudioLayerId(null);
+          return;
+        }
+      }
+
+      if (
+        (e.key === 'ArrowLeft' ||
+          e.key === 'ArrowRight' ||
+          e.key === 'ArrowUp' ||
+          e.key === 'ArrowDown') &&
+        studioEngine.engineMode === 'studio' &&
+        !cinemaMode &&
+        activeTab !== 'gallery' &&
+        selectedStudioLayerId &&
+        activeStudioScene
+      ) {
+        const selectedLayer = activeStudioScene.layers.find(
+          (l) => l.id === selectedStudioLayerId && l.visible
+        );
+        const selectedSource = selectedLayer
+          ? studioEngine.projectSources.find((s) => s.id === selectedLayer.sourceId)
+          : undefined;
+        if (selectedLayer && isVisualSourceEditable(selectedSource)) {
+          e.preventDefault();
+          if (selectedLayer.locked) return;
+          const res = computeKeyboardNudgeTransform(selectedLayer.transform, e.key, {
+            shiftKey: e.shiftKey,
+            altKey: e.altKey,
+            scene: activeStudioScene,
+            layer: selectedLayer,
+            sources: studioEngine.projectSources,
+          });
+          if (res) {
+            studioEngine.updateSceneLayerTransform(
+              activeStudioScene.id,
+              selectedLayer.id,
+              res.transform,
+              {
+                historyGroupKey: `nudge:${selectedLayer.id}`,
+                historyLabel: 'Ajustar posición',
+              }
+            );
+          }
+          return;
+        }
       }
 
       if (e.code === 'Space') {
@@ -2146,7 +2357,16 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [triggerPhotoCapture, toggleRecording, cinemaMode]);
+  }, [
+    triggerPhotoCapture,
+    toggleRecording,
+    cinemaMode,
+    activeTab,
+    selectedStudioLayerId,
+    activeStudioScene,
+    studioEngine,
+    showToast,
+  ]);
 
   // Native macOS Desktop Menu Actions & safe hardware release on window close
   useEffect(() => {
@@ -2244,9 +2464,14 @@ export default function App() {
     isRecordingLocked: studioEngine.isRecordingLocked,
     activeSceneId: studioEngine.activeSceneId,
     scenes: studioEngine.scenes,
+    projectSources: studioEngine.projectSources,
     sources: studioEngine.sources,
+    outputWidth: studioEngine.outputWidth,
+    outputHeight: studioEngine.outputHeight,
+    selectedLayerId: selectedStudioLayerId,
     hasLiveDisplaySource: studioEngine.hasLiveDisplaySource,
     lastError: studioEngine.lastError,
+    historyStatus: studioEngine.historyStatus,
     diagnosticsSnapshot: studioEngine.diagnosticsSnapshot,
     compatibilityMatrix: studioEngine.compatibilityMatrix,
     onSwitchEngineMode: (mode) => handleSwitchEngineMode(mode),
@@ -2254,13 +2479,84 @@ export default function App() {
       void studioEngine.switchScene(sceneId, transitionOverride),
     onActivatePresetScene: (presetId, transitionOverride) =>
       void studioEngine.activatePresetScene(presetId, transitionOverride),
-    onAuthorizeDisplaySource: () => void handleAuthorizeStudioDisplaySource(),
+    onAuthorizeDisplaySource: (sourceId?: string) =>
+      void handleAuthorizeStudioDisplaySource(sourceId),
+    onReconnectSource: (sourceId: string) =>
+      void studioEngine.reconnectSource(sourceId, true),
+    onAddDisplaySource: (kind: 'screen' | 'window') =>
+      handleAddStudioDisplaySource(kind),
     onChangeBackendPreference: handleChangeStudioBackend,
     onRecoverCanvas2dFallback: handleRecoverStudioCanvas2d,
     onRefreshDiagnostics: () => {
       studioEngine.refreshDiagnostics();
     },
     onResetProject: () => void studioEngine.resetProject(),
+    onSelectLayer: setSelectedStudioLayerId,
+    onUpdateLayerTransform: (sceneId, layerId, patch, opts) => {
+      studioEngine.updateSceneLayerTransform(sceneId, layerId, patch, opts);
+    },
+    onUpdateLayerStyle: (sceneId, layerId, stylePatch, opts) => {
+      studioEngine.updateSceneLayerStyle(sceneId, layerId, stylePatch, opts);
+    },
+    onApplyAdaptableLayout: (sceneId, layoutId, opts) => {
+      studioEngine.applyAdaptableLayout(sceneId, layoutId, {
+        sensorWidth: sensorSize.w,
+        sensorHeight: sensorSize.h,
+        selectedLayerId: selectedStudioLayerId ?? undefined,
+        participatingLayerIds: opts?.participatingLayerIds,
+        primaryDisplayLayerId: opts?.primaryDisplayLayerId,
+        secondaryDisplayLayerId: opts?.secondaryDisplayLayerId,
+        primaryCameraLayerId: opts?.primaryCameraLayerId,
+      });
+    },
+    onToggleLayerLock: (sceneId, layerId, locked) => {
+      studioEngine.setSceneLayerLocked(sceneId, layerId, locked);
+    },
+    onReorderLayers: (sceneId, orderedLayerIds) => {
+      studioEngine.reorderSceneLayers(sceneId, orderedLayerIds);
+    },
+    onMoveLayerOrder: (sceneId, layerId, direction) => {
+      studioEngine.moveSceneLayerOrder(sceneId, layerId, direction);
+    },
+    onPlaceLayerBehindCamera: (sceneId, layerId) => {
+      studioEngine.placeSceneLayerBehindCamera(sceneId, layerId);
+    },
+    onToggleLayerVisible: (sceneId, layerId, visible) =>
+      studioEngine.setSceneLayerVisible(sceneId, layerId, visible),
+    onRenameLayer: (sceneId, layerId, newName) => {
+      studioEngine.renameSceneLayer(sceneId, layerId, newName);
+    },
+    onDuplicateLayer: (sceneId, layerId) =>
+      studioEngine.duplicateSceneLayer(sceneId, layerId),
+    onResetLayerTransform: (sceneId, layerId) => {
+      studioEngine.resetSceneLayerTransform(sceneId, layerId);
+    },
+    onResetLayerStyle: (sceneId, layerId) => {
+      studioEngine.resetSceneLayerStyle(sceneId, layerId);
+    },
+    onRemoveLayer: (sceneId, layerId) =>
+      studioEngine.removeSceneLayer(sceneId, layerId),
+    onAddRealSource: (sceneId, request) =>
+      studioEngine.addRealSourceToScene(sceneId, request),
+    onAddExistingSourceToScene: (sceneId, sourceId, opts) =>
+      studioEngine.addExistingSourceToScene(sceneId, sourceId, opts),
+    onRenameProjectSource: (sourceId, newName) =>
+      studioEngine.renameProjectSource(sourceId, newName),
+    onRemoveSourceSafely: (sourceId) =>
+      studioEngine.removeProjectSourceSafely(sourceId),
+    onEnumerateDevices: () => studioEngine.enumerateAvailableDevices(),
+    onUndo: async () => {
+      const res = await studioEngine.undoComposition();
+      if (res.ok) {
+        showToast(`Deshacer: ${res.label ?? 'composición'}`);
+      }
+    },
+    onRedo: async () => {
+      const res = await studioEngine.redoComposition();
+      if (res.ok) {
+        showToast(`Rehacer: ${res.label ?? 'composición'}`);
+      }
+    },
   };
 
   return (
@@ -2356,6 +2652,7 @@ export default function App() {
             isDualCamActive={dualCam.enabled}
             onToggleScreenPip={() => void toggleScreenPip()}
             onReconnectSource={(sourceId) => void studioEngine.reconnectSource(sourceId, true)}
+            isTransparentCutoutActive={background.mode === 'transparent'}
             onOpenRecordingLab={() => {
               setActiveTab('record');
               setStudioLabOpen(true);
@@ -2369,8 +2666,8 @@ export default function App() {
           onToggleCinemaMode={() => setCinemaMode((v) => !v)}
           canvasRef={canvasRef}
           aspectRatio={aspectRatio}
-          resolutionWidth={dims.w}
-          resolutionHeight={dims.h}
+          resolutionWidth={studioEngine.engineMode === 'studio' ? studioEngine.outputWidth : dims.w}
+          resolutionHeight={studioEngine.engineMode === 'studio' ? studioEngine.outputHeight : dims.h}
           sensorSize={sensorSize}
           cameraStatus={cameraStatus}
           cameraLabel={cameraLabel}
@@ -2436,8 +2733,64 @@ export default function App() {
           isDualCamActive={dualCam.enabled}
           isOutputPipActive={isOutputPipActive}
           onToggleOutputPip={() => void toggleOutputPip()}
-          detectedSubjects={detectedSubjects}
           aiStatus={aiStatus}
+          studioLayerEditor={{
+            enabled: studioEngine.engineMode === 'studio',
+            activeScene: activeStudioScene,
+            sources: studioEngine.projectSources,
+            selectedLayerId: selectedStudioLayerId,
+            onSelectLayer: setSelectedStudioLayerId,
+            onUpdateLayerTransform: studioEngine.updateSceneLayerTransform,
+            onToggleLayerLock: studioEngine.setSceneLayerLocked,
+            onBeginLayerEdit: studioEngine.beginCompositionGesture,
+            onCommitLayerEdit: () => {
+              studioEngine.commitCompositionGesture();
+              void studioEngine.flushPersistence();
+            },
+            onMoveLayerOrder: studioEngine.moveSceneLayerOrder,
+            onToggleLayerVisible: (sceneId, layerId, visible) => {
+              void studioEngine.setSceneLayerVisible(sceneId, layerId, visible);
+            },
+            onResetLayerTransform: studioEngine.resetSceneLayerTransform,
+          }}
+          studioDisplayPopover={{
+            enabled: studioEngine.engineMode === 'studio',
+            activeScene: activeStudioScene,
+            sources: studioEngine.projectSources,
+            runtimeSources: studioEngine.sources,
+            layerDiagnostics: studioEngine.diagnosticsSnapshot?.layerDiagnostics,
+            selectedLayerId: selectedStudioLayerId,
+            onSelectOrAddDisplayLayer: (sourceId) => {
+              if (!activeStudioScene) return;
+              const existingLayer = activeStudioScene.layers.find(
+                (l) => l.sourceId === sourceId
+              );
+              if (existingLayer) {
+                setSelectedStudioLayerId(existingLayer.id);
+              } else {
+                void studioEngine
+                  .addExistingSourceToScene(activeStudioScene.id, sourceId, {
+                    placement: 'behind-camera',
+                  })
+                  .then((res) => {
+                    if (res.ok && res.layer) {
+                      setSelectedStudioLayerId(res.layer.id);
+                    }
+                  });
+              }
+            },
+            onChangeDisplayCapture: (sourceId) =>
+              void handleAuthorizeStudioDisplaySource(sourceId),
+            onAddDisplaySource: (kind) => void handleAddStudioDisplaySource(kind),
+            onPlaceLayerBehindCamera: (layerId) => {
+              if (!activeStudioScene) return;
+              studioEngine.placeSceneLayerBehindCamera(activeStudioScene.id, layerId);
+            },
+            onMoveLayerToTop: (layerId) => {
+              if (!activeStudioScene) return;
+              studioEngine.moveSceneLayerOrder(activeStudioScene.id, layerId, 'top');
+            },
+          }}
         />
 
         {activeTab !== 'gallery' && !cinemaMode && !inspectorCollapsed && (

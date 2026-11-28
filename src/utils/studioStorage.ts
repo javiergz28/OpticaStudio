@@ -160,6 +160,7 @@ function normalizeLayerRecord(
 
   const transformRaw = isPlainObject(raw.transform) ? raw.transform : {};
   const styleRaw = isPlainObject(raw.style) ? raw.style : {};
+  const clampedStyle = clampLayerStyle(styleRaw as Partial<SceneLayer['style']>);
 
   return {
     id,
@@ -169,7 +170,7 @@ function normalizeLayerRecord(
     visible: typeof raw.visible === 'boolean' ? raw.visible : true,
     locked: typeof raw.locked === 'boolean' ? raw.locked : false,
     transform: clampLayerTransform(transformRaw as Partial<SceneLayer['transform']>),
-    style: clampLayerStyle(styleRaw as Partial<SceneLayer['style']>),
+    style: clampedStyle,
     overrideSourceProcessing:
       typeof raw.overrideSourceProcessing === 'boolean'
         ? raw.overrideSourceProcessing

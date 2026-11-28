@@ -18,6 +18,7 @@ import type {
   VideoFileSourceDefinition,
   WindowSourceDefinition,
 } from '../types/studio';
+import { isStudioAssetRef, loadStudioAssetBlob } from '../utils/studioAssetStore';
 
 // ============================================================================
 // TIPOS PÚBLICOS DE PLATAFORMA, CONSUMIDORES Y METADATOS DE EJECUCIÓN
@@ -378,6 +379,10 @@ export function createBrowserMediaElementFactoryAdapter(): MediaElementFactoryAd
 
 export function createBrowserAssetUrlAdapter(): AssetUrlAdapter {
   return {
+    async resolveAssetBlob(assetRef: string): Promise<Blob | null> {
+      if (!isStudioAssetRef(assetRef)) return null;
+      return loadStudioAssetBlob(assetRef);
+    },
     createObjectURL(blob: Blob): string {
       if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
         throw new Error('URL.createObjectURL no está disponible.');
@@ -1020,10 +1025,19 @@ export class SourceManager {
       return entry.inFlightPromise;
     }
 
+    const preserveLiveDisplay =
+      Boolean(options.force) &&
+      (entry.source.kind === 'window' || entry.source.kind === 'screen') &&
+      (entry.state.status === 'live' || entry.state.status === 'paused') &&
+      Boolean(entry.resources.mediaStream) &&
+      entry.ownedTracks.some((t) => t.kind === 'video' && t.readyState !== 'ended');
+
     if (options.force) {
       entry.operationToken += 1;
       entry.inFlightPromise = null;
-      this.teardownEntryResources(entry, 'user-released', 'idle');
+      if (!preserveLiveDisplay) {
+        this.teardownEntryResources(entry, 'user-released', 'idle');
+      }
     }
 
     if (entry.consumers.size === 0) {
@@ -1034,7 +1048,7 @@ export class SourceManager {
     const result = await this.startInitialization(entry, {
       linkedDisplaySourceId: options.linkedDisplaySourceId,
       retryOnError: true,
-    });
+    }, preserveLiveDisplay ? entry.state.status : undefined);
     if (result.state.status === 'live') {
       this.emit({
         type: 'reconnected',
@@ -1125,18 +1139,27 @@ export class SourceManager {
 
   private startInitialization(
     entry: InternalEntry,
-    options: SourceAcquireOptions
+    options: SourceAcquireOptions,
+    preserveLiveStatus?: SourceExecutionStatus
   ): Promise<SourceRuntimeEntry> {
     const opToken = ++entry.operationToken;
     const epoch = this.globalEpoch;
 
-    this.transitionState(entry, 'initializing', {
-      errorCode: null,
-      errorMessage: undefined,
-      disconnectionReason: 'none',
-    });
+    if (!preserveLiveStatus) {
+      this.transitionState(entry, 'initializing', {
+        errorCode: null,
+        errorMessage: undefined,
+        disconnectionReason: 'none',
+      });
+    }
 
-    const promise = this.executeAcquisition(entry, options, opToken, epoch).finally(() => {
+    const promise = this.executeAcquisition(
+      entry,
+      options,
+      opToken,
+      epoch,
+      preserveLiveStatus
+    ).finally(() => {
       if (entry.operationToken === opToken) {
         entry.inFlightPromise = null;
       }
@@ -1160,7 +1183,8 @@ export class SourceManager {
     entry: InternalEntry,
     options: SourceAcquireOptions,
     opToken: number,
-    epoch: number
+    epoch: number,
+    preserveLiveStatus?: SourceExecutionStatus
   ): Promise<SourceRuntimeEntry> {
     const src = entry.source;
 
@@ -1192,7 +1216,11 @@ export class SourceManager {
         return this.toPublicEntry(entry);
       }
 
-      this.transitionState(entry, 'live');
+      this.transitionState(entry, 'live', {
+        errorCode: null,
+        errorMessage: undefined,
+        disconnectionReason: 'none',
+      });
       return this.toPublicEntry(entry);
     } catch (err) {
       if (!this.isOperationStillValid(entry, opToken, epoch)) {
@@ -1203,6 +1231,25 @@ export class SourceManager {
         err instanceof SourceManagerError
           ? { code: err.code, message: err.message }
           : classifyMediaError(err);
+
+      // Si el usuario cancela el cambio de captura sobre una ventana/pantalla ya en vivo
+      // (Chromium/Electron suelen emitir AbortError o NotAllowedError al cancelar el picker),
+      // conservar la captura activa anterior intacta.
+      if (
+        preserveLiveStatus &&
+        (classified.code === 'user-canceled' ||
+          (classified.code === 'permission-denied' &&
+            (src.kind === 'window' || src.kind === 'screen'))) &&
+        entry.resources.mediaStream &&
+        entry.ownedTracks.some((t) => t.kind === 'video' && t.readyState !== 'ended')
+      ) {
+        this.transitionState(entry, preserveLiveStatus, {
+          errorCode: 'user-canceled',
+          errorMessage: undefined,
+          disconnectionReason: 'none',
+        });
+        return this.toPublicEntry(entry);
+      }
 
       this.teardownEntryResources(entry, 'none', 'error', {
         errorCode: classified.code,
@@ -1361,6 +1408,10 @@ export class SourceManager {
         this.stopStreamTracksUnconditionally(stream);
         return;
       }
+    }
+
+    if (entry.resources.mediaStream && entry.resources.mediaStream !== stream) {
+      this.teardownEntryResources(entry, 'user-released', entry.state.status);
     }
 
     entry.resources.mediaStream = stream;
@@ -1625,6 +1676,16 @@ export class SourceManager {
     entry.state.intrinsicHeight = video.videoHeight || 0;
     entry.details.hasVideoTrack = true;
     entry.details.hasAudioTrack = !src.mutedByDefault;
+    if (typeof video.play === 'function') {
+      try {
+        const playResult = video.play();
+        if (playResult && typeof (playResult as Promise<void>).catch === 'function') {
+          (playResult as Promise<void>).catch(() => {});
+        }
+      } catch {
+        // Ignorar bloqueos de reproducción automática
+      }
+    }
   }
 
   private async acquireAudioFileSource(

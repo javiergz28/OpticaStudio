@@ -7,18 +7,24 @@ import {
   createEmptyProject,
   createScene,
   deleteScene,
+  duplicateLayerInScene,
   duplicateScene,
   getSourceUsageCount,
   moveLayerOrder,
   removeLayerFromScene,
   removeSourceIfUnused,
+  removeSourceSafely,
+  renameLayerInScene,
   renameScene,
   reorderSceneLayers,
+  resetLayerStyleInScene,
+  resetLayerTransformInScene,
   resolveEffectiveLayerProcessing,
   setActiveScene,
   setLayerLocked,
   setLayerVisibility,
   updateLayerProcessing,
+  updateLayerStyle,
   updateLayerTransform,
   validateProjectReferences,
 } from '../src/engine/sceneEngine';
@@ -365,4 +371,89 @@ test('9. Compatibilidad e integridad de las 7 plantillas iniciales', () => {
     assert.equal(roundTrip.recovered, false);
     assert.equal(roundTrip.project.scenes.length, project.scenes.length);
   }
+});
+
+test('10. CP-P02-C2: Renombrado, duplicación de capa sin duplicar fuente, restablecimiento y eliminación segura de fuentes', () => {
+  let project = instantiatePresetProject('ai-tutorial-pip');
+  const sceneId = project.activeSceneId;
+  const origScene = project.scenes[0];
+  const origSourcesCount = project.sources.length;
+  const targetLayer = origScene.layers[1];
+
+  // Renombrar capa (ignora cadenas vacías)
+  project = renameLayerInScene(project, sceneId, targetLayer.id, 'Cámara Presentador');
+  assert.equal(
+    project.scenes[0].layers.find((l) => l.id === targetLayer.id)?.name,
+    'Cámara Presentador'
+  );
+  project = renameLayerInScene(project, sceneId, targetLayer.id, '   ');
+  assert.equal(
+    project.scenes[0].layers.find((l) => l.id === targetLayer.id)?.name,
+    'Cámara Presentador'
+  );
+
+  // Modificar transformación y estilo y luego duplicar capa
+  project = updateLayerTransform(project, sceneId, targetLayer.id, {
+    x: 0.12,
+    y: 0.14,
+    width: 0.35,
+    height: 0.35,
+    rotationDeg: 18,
+  });
+  project = updateLayerStyle(project, sceneId, targetLayer.id, {
+    maskShape: 'circle',
+    featherPx: 20,
+    opacity: 0.75,
+  });
+
+  const dup = duplicateLayerInScene(project, sceneId, targetLayer.id);
+  project = dup.project;
+  assert.ok(dup.layer);
+  assert.notEqual(dup.layer.id, targetLayer.id);
+  assert.equal(dup.layer.sourceId, targetLayer.sourceId);
+  assert.equal(project.sources.length, origSourcesCount, 'No debe duplicar StudioSource');
+  assert.equal(dup.layer.name, 'Cámara Presentador (Copia)');
+  assert.equal(dup.layer.style.maskShape, 'circle');
+  assert.deepEqual(
+    project.scenes[0].layers.map((l) => l.zIndex),
+    project.scenes[0].layers.map((_, i) => i)
+  );
+
+  // Restablecer transformación y apariencia en la capa duplicada
+  project = resetLayerTransformInScene(project, sceneId, dup.layer.id);
+  project = resetLayerStyleInScene(project, sceneId, dup.layer.id);
+  const resetDup = project.scenes[0].layers.find((l) => l.id === dup.layer!.id)!;
+  assert.equal(resetDup.transform.width, 1);
+  assert.equal(resetDup.transform.height, 1);
+  assert.equal(resetDup.transform.rotationDeg, 0);
+  assert.equal(resetDup.style.maskShape, 'rect');
+  assert.equal(resetDup.style.featherPx, 0);
+
+  // Bloqueo impide restablecer
+  project = setLayerLocked(project, sceneId, targetLayer.id, true);
+  project = resetLayerTransformInScene(project, sceneId, targetLayer.id);
+  project = resetLayerStyleInScene(project, sceneId, targetLayer.id);
+  const stillCustom = project.scenes[0].layers.find((l) => l.id === targetLayer.id)!;
+  assert.equal(stillCustom.transform.rotationDeg, 18);
+  assert.equal(stillCustom.style.maskShape, 'circle');
+
+  // Eliminación segura de fuente: bloquea si está en uso y permite si quedó sin referencias
+  const usedAttempt = removeSourceSafely(project, targetLayer.sourceId);
+  assert.equal(usedAttempt.removed, false);
+  assert.ok(usedAttempt.usageCount >= 2);
+
+  const extraSrc = addSource(project, {
+    kind: 'color',
+    name: 'Fondo sin uso',
+    color: '#111827',
+  });
+  project = extraSrc.project;
+  const unusedAttempt = removeSourceSafely(project, extraSrc.source.id);
+  assert.equal(unusedAttempt.removed, true);
+  assert.equal(unusedAttempt.usageCount, 0);
+  assert.equal(
+    unusedAttempt.project.sources.some((s) => s.id === extraSrc.source.id),
+    false
+  );
+  assert.equal(validateProjectReferences(unusedAttempt.project).valid, true);
 });
